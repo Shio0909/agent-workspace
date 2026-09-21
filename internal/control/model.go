@@ -1,0 +1,205 @@
+package control
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"time"
+)
+
+var (
+	ErrNotFound = errors.New("workspace not found")
+	ErrConflict = errors.New("workspace is busy or has a conflicting definition")
+	ErrInvalid  = errors.New("invalid request")
+	// ErrExpired 表示租期已过。挂起态只能靠续期恢复（PVC 还在，但工作负载
+	// 已经缩容到 0），所以调用方必须先续期再唤醒，见 SetExpiry。
+	ErrExpired = errors.New("workspace expired")
+
+	// 幂等记录的状态机是 processing -> success | failed。两个终态都不可逆：
+	// 重复提交只会拿到第一次的结果，不会产生第二次副作用。调用方要重试就
+	// 换一个新的 biz_id。
+	ErrOperationInProgress = errors.New("operation already in progress")
+	ErrOperationSucceeded  = errors.New("operation already succeeded")
+	ErrOperationFailed     = errors.New("operation already failed")
+
+	namePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,39}$`)
+	// biz_id 由调用方提供，允许 UUID 或带前缀的追踪号。限制字符集是因为它
+	// 会进入审计日志和状态快照，不希望出现控制字符或换行。
+	bizPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`)
+)
+
+// desired 与 phase 的取值。两者都会进入 JSON 快照和 HTTP 响应，改名等于改协议。
+const (
+	DesiredRunning   = "running"
+	DesiredStopped   = "stopped"
+	DesiredSuspended = "suspended"
+	DesiredDeleted   = "deleted"
+
+	PhaseStarting  = "starting"
+	PhaseRunning   = "running"
+	PhaseStopped   = "stopped"
+	PhaseSuspended = "suspended"
+	PhaseDeleted   = "deleted"
+	PhaseError     = "error"
+)
+
+// 幂等记录的状态。
+const (
+	OpProcessing = "processing"
+	OpSuccess    = "success"
+	OpFailed     = "failed"
+)
+
+// 幂等记录的操作类型。Type 是记录的一部分但不是键的一部分：同一个 biz_id
+// 换一个动作会被拒绝，而不是默默产生第二次副作用。
+const (
+	OpStart   = "start"
+	OpStop    = "stop"
+	OpRestart = "restart"
+	OpDelete  = "delete"
+)
+
+// 审计动作。前 11 个覆盖完整的生命周期与租约路径，后 3 个是续期相关动作：
+// resume 表示挂起工作区被人工续期恢复，expiry-set 表示只改租期不改状态。
+const (
+	ActionCreate       = "create"
+	ActionStart        = "start"
+	ActionStop         = "stop"
+	ActionRestart      = "restart"
+	ActionDelete       = "delete"
+	ActionLeaseAcquire = "lease-acquire"
+	ActionLeaseRelease = "lease-release"
+	ActionIdleStop     = "idle-stop"
+	ActionExpire       = "expire"
+	ActionSuspend      = "suspend"
+	ActionHardDelete   = "hard-delete"
+	ActionResume       = "resume"
+	ActionExpirySet    = "expiry-set"
+)
+
+const (
+	// ActorSystem 表示动作由调度循环自己发起（空闲回收、过期挂起、宽限硬删）。
+	ActorSystem = "system"
+	// ActorUnknown 表示调用方没有提供归属信息。Actor 只是归属信息，不是授权
+	// 依据：控制面只校验一个共享令牌，调用方可以声称任意身份。
+	ActorUnknown = "unknown"
+)
+
+type Profile struct {
+	Image        string            `json:"image"`
+	Port         int               `json:"port"`
+	HealthPath   string            `json:"health_path"`
+	MountPath    string            `json:"mount_path"`
+	Storage      string            `json:"storage"`
+	CPU          string            `json:"cpu"`
+	Memory       string            `json:"memory"`
+	Command      []string          `json:"command,omitempty"`
+	Args         []string          `json:"args,omitempty"`
+	Env          map[string]string `json:"env,omitempty"`
+	EnvSecret    string            `json:"env_secret,omitempty"`
+	ConfigSecret string            `json:"config_secret,omitempty"`
+	ConfigPath   string            `json:"config_path,omitempty"`
+}
+
+func (p Profile) Validate() error {
+	if p.Image == "" || p.Port < 1 || p.Port > 65535 || p.Storage == "" || p.CPU == "" || p.Memory == "" {
+		return fmt.Errorf("%w: profile needs image, port, storage, cpu and memory", ErrInvalid)
+	}
+	if len(p.MountPath) < 2 || p.MountPath[0] != '/' || len(p.HealthPath) == 0 || p.HealthPath[0] != '/' {
+		return fmt.Errorf("%w: mount_path and health_path must be absolute", ErrInvalid)
+	}
+	if p.ConfigSecret != "" && (len(p.ConfigPath) < 2 || p.ConfigPath[0] != '/') {
+		return fmt.Errorf("%w: config_secret needs an absolute config_path", ErrInvalid)
+	}
+	return nil
+}
+
+type Workspace struct {
+	ID           string               `json:"id"`
+	Profile      string               `json:"profile"`
+	Desired      string               `json:"desired"`
+	Phase        string               `json:"phase"`
+	LastActivity time.Time            `json:"last_activity"`
+	UpdatedAt    time.Time            `json:"updated_at"`
+	LastError    string               `json:"last_error,omitempty"`
+	Leases       map[string]time.Time `json:"leases,omitempty"`
+	// ExpiresAt 是租期截止时间，零值表示永不过期。它是回收链条的起点：
+	// 到期后工作区先被挂起（保留 PVC），宽限期满才硬删。
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	// SuspendedAt 是进入挂起态的时刻，宽限期从这里开始计时。它必须持久化，
+	// 否则控制器重启会把宽限期重新计时，硬删被无限推迟。
+	SuspendedAt time.Time `json:"suspended_at,omitempty"`
+	// RestartPending 和 Desired 一样是持久化意图：控制器在重启后仍会补做
+	// 这次重启，而不是把用户的请求丢掉。
+	RestartPending bool `json:"restart_pending,omitempty"`
+	// DeletionReason 记录这次删除由谁发起。它不影响行为，只影响审计措辞，
+	// 但删除失败重试几轮之后仍然要能说清楚"是谁要删的"。
+	DeletionReason string `json:"deletion_reason,omitempty"`
+}
+
+// DeletionReason 的取值。
+const (
+	DeletedByUser  = "user"
+	DeletedByGrace = "grace"
+)
+
+// expired 判断租期是否已过。零值 ExpiresAt 表示永不过期。
+func (w Workspace) expired(now time.Time) bool {
+	return !w.ExpiresAt.IsZero() && !now.Before(w.ExpiresAt)
+}
+
+// Operation 是一条跨请求的幂等记录。BizID 由调用方提供，是唯一的幂等键；
+// 记录只保留一份，所以重复提交能拿到第一次的结论而不是再执行一次。
+type Operation struct {
+	BizID     string `json:"biz_id"`
+	Workspace string `json:"workspace"`
+	Type      string `json:"type"`
+	Status    string `json:"status"`
+	// Error 只保存消息文本。重启后无法还原原始错误类型，所以重放失败时
+	// 只能给出消息，不能保证和第一次的 HTTP 状态码一致。
+	Error      string    `json:"error,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+}
+
+type Observation struct {
+	Exists   bool
+	Ready    bool
+	Endpoint string
+}
+
+// Runtime owns compute and workspace storage. Stop must preserve storage;
+// Delete removes it only after an explicit workspace deletion request.
+type Runtime interface {
+	Ensure(context.Context, Workspace, Profile) error
+	Observe(context.Context, Workspace, Profile) (Observation, error)
+	Stop(context.Context, Workspace) error
+	Delete(context.Context, Workspace) error
+	// Restart replaces the workload without touching storage. The volume is
+	// preserved for the same reason Stop preserves it.
+	Restart(context.Context, Workspace) error
+	// Probe reports whether the compute backend is reachable. It backs the
+	// readiness endpoint, so it must be cheap and bounded by ctx.
+	Probe(context.Context) error
+}
+
+func ValidName(name string) bool { return namePattern.MatchString(name) }
+
+// validDesired 只接受调用方可以显式设置的目标状态。suspended 是控制面自己
+// 的回收决策，不是外部可以指定的意图。
+func validDesired(desired string) bool {
+	switch desired {
+	case DesiredRunning, DesiredStopped, DesiredDeleted:
+		return true
+	}
+	return false
+}
+
+func validOpType(opType string) bool {
+	switch opType {
+	case OpStart, OpStop, OpRestart, OpDelete:
+		return true
+	}
+	return false
+}
