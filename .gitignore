@@ -1,0 +1,6 @@
+/bin/
+/data/
+/configs/local.json
+*.test
+coverage.out
+.DS_Store
