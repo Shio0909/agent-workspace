@@ -1,0 +1,591 @@
+package control
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+)
+
+type slot struct {
+	mu         sync.Mutex
+	active     int
+	endpoint   string
+	readyUntil time.Time
+}
+
+const runtimeReadyTTL = 5 * time.Second
+
+type Controller struct {
+	store            *Store
+	runtime          Runtime
+	profiles         map[string]Profile
+	slots            sync.Map
+	IdleTimeout      time.Duration
+	OperationTimeout time.Duration
+	PollInterval     time.Duration
+	// GracePeriod 是 suspended 到硬删之间的宽限期，也是人工介入恢复的窗口。
+	// 挂起态保留 PVC，宽限期结束才会连存储一起删除。
+	GracePeriod time.Duration
+	// StartupGrace 是进程启动后的回收静默期。重启时工作区可能正在恢复，
+	// 或者调用方正准备续期，第一轮扫描不应该把它们当成垃圾回收掉。
+	StartupGrace time.Duration
+	// OperationLease 是 processing 幂等记录的存活上限。它必须大于一次动作
+	// 的最长耗时，否则正在执行的操作会被误判成崩溃残留而被接管。
+	OperationLease time.Duration
+	// ProbeTimeout 与 ReadyTTL 控制就绪探针：单次探测的上限，以及结果的
+	// 缓存时长，避免频繁探针变成对后端 API 的压测。
+	ProbeTimeout time.Duration
+	ReadyTTL     time.Duration
+	// Metrics 由 New 初始化，控制器内部只做原子自增。
+	Metrics *Metrics
+
+	now      func() time.Time
+	started  time.Time
+	readyMu  sync.Mutex
+	readyErr error
+	readyAt  time.Time
+}
+
+func New(store *Store, runtime Runtime, profiles map[string]Profile, idle time.Duration) *Controller {
+	return &Controller{store: store, runtime: runtime, profiles: profiles,
+		IdleTimeout: idle, OperationTimeout: time.Minute, PollInterval: time.Second,
+		GracePeriod: 24 * time.Hour, StartupGrace: time.Minute, OperationLease: 10 * time.Minute,
+		ProbeTimeout: 3 * time.Second, ReadyTTL: 2 * time.Second,
+		Metrics: &Metrics{}, now: time.Now, started: time.Now()}
+}
+
+func (c *Controller) slot(id string) *slot {
+	s, _ := c.slots.LoadOrStore(id, &slot{})
+	return s.(*slot)
+}
+
+func (c *Controller) Get(id string) (Workspace, error) { return c.store.Get(id) }
+func (c *Controller) List() []Workspace                { return c.store.List() }
+
+// Scan 返回按 ID 排序的一页工作区，more 表示后面还有。调度循环用它分批推进，
+// 而不是一次把整个快照展开成工作集。
+func (c *Controller) Scan(after string, limit int) ([]Workspace, bool) {
+	return c.store.Scan(after, limit)
+}
+
+// Audit 查询审计日志。它读的是磁盘上的追加文件，所以控制器重启前写下的记录
+// 依然可见。
+func (c *Controller) Audit(q AuditQuery) ([]AuditEvent, error) {
+	return c.store.Audit().Query(q)
+}
+
+func (c *Controller) Create(actor, id, profile string) (Workspace, error) {
+	if !ValidName(id) {
+		return Workspace{}, fmt.Errorf("%w: invalid workspace id", ErrInvalid)
+	}
+	if _, ok := c.profiles[profile]; !ok {
+		return Workspace{}, fmt.Errorf("%w: unknown profile", ErrInvalid)
+	}
+	s := c.slot(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w, err := c.store.Get(id); err == nil {
+		if w.Profile == profile && w.Desired != DesiredDeleted {
+			return w, nil
+		}
+		return Workspace{}, ErrConflict
+	} else if !errors.Is(err, ErrNotFound) {
+		return Workspace{}, err
+	}
+	now := c.now()
+	w := Workspace{ID: id, Profile: profile, Desired: DesiredStopped, Phase: PhaseStopped,
+		LastActivity: now, UpdatedAt: now}
+	if err := c.store.Put(w); err != nil {
+		return Workspace{}, err
+	}
+	c.audit(actor, ActionCreate, id, "profile="+profile, ResultOK)
+	return w, nil
+}
+
+func hasLease(w Workspace, now time.Time) bool {
+	for _, expires := range w.Leases {
+		if now.Before(expires) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetDesired durably records intent before touching Kubernetes. Reconcile can
+// therefore finish an interrupted operation after the controller restarts.
+func (c *Controller) SetDesired(actor, id, desired string) (Workspace, error) {
+	if !validDesired(desired) {
+		return Workspace{}, ErrInvalid
+	}
+	s := c.slot(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w, err := c.store.Get(id)
+	if err != nil {
+		return w, err
+	}
+	now := c.now()
+	if w.Desired == DesiredDeleted && desired != DesiredDeleted {
+		return w, ErrConflict
+	}
+	// 挂起和过期都只能靠续期恢复：PVC 还在，但直接唤醒会让调用方一直等到
+	// 超时，因为下一轮扫描会立刻把它重新挂起。删除是唯一例外。
+	if desired != DesiredDeleted && (w.Desired == DesiredSuspended || (desired == DesiredRunning && w.expired(now))) {
+		return w, ErrExpired
+	}
+	if desired != DesiredRunning && (s.active > 0 || hasLease(w, now)) {
+		return w, ErrConflict
+	}
+	w.Desired, w.UpdatedAt, w.LastError = desired, now, ""
+	if desired == DesiredRunning {
+		w.LastActivity = now
+	}
+	if desired == DesiredDeleted {
+		w.DeletionReason = DeletedByUser
+	}
+	if err := c.store.Put(w); err != nil {
+		return w, err
+	}
+	s.endpoint, s.readyUntil = "", time.Time{}
+	c.audit(actor, desiredAction(desired), id, "desired="+desired, ResultOK)
+	return w, nil
+}
+
+// Restart records a durable restart intent. Like start and stop, the runtime
+// replacement itself happens on the next reconcile, so the request does not
+// block on Kubernetes.
+func (c *Controller) Restart(actor, id string) (Workspace, error) {
+	s := c.slot(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w, err := c.store.Get(id)
+	if err != nil {
+		return w, err
+	}
+	now := c.now()
+	if w.Desired == DesiredDeleted {
+		return w, ErrConflict
+	}
+	if w.Desired == DesiredSuspended || w.expired(now) {
+		return w, ErrExpired
+	}
+	if s.active > 0 || hasLease(w, now) {
+		return w, ErrConflict
+	}
+	w.Desired, w.RestartPending, w.Phase = DesiredRunning, true, PhaseStarting
+	w.LastActivity, w.UpdatedAt, w.LastError = now, now, ""
+	if err := c.store.Put(w); err != nil {
+		return w, err
+	}
+	s.endpoint, s.readyUntil = "", time.Time{}
+	c.audit(actor, ActionRestart, id, "workload replaced, volume retained", ResultOK)
+	return w, nil
+}
+
+// SetExpiry sets, extends or clears the deadline, and is the only way back from
+// a suspended workspace. Resuming only rewrites intent: suspension never
+// removed storage, so there is nothing to prepare again.
+func (c *Controller) SetExpiry(actor, id string, expiresAt time.Time) (Workspace, error) {
+	s := c.slot(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w, err := c.store.Get(id)
+	if err != nil {
+		return w, err
+	}
+	if w.Desired == DesiredDeleted {
+		return w, ErrConflict
+	}
+	now := c.now()
+	w.ExpiresAt, w.UpdatedAt = expiresAt, now
+	action, detail := ActionExpirySet, "expires_at="+formatDeadline(expiresAt)
+	if w.Desired == DesiredSuspended && (expiresAt.IsZero() || now.Before(expiresAt)) {
+		w.Desired, w.SuspendedAt = DesiredStopped, time.Time{}
+		action, detail = ActionResume, "resumed with expires_at="+formatDeadline(expiresAt)
+	}
+	if err := c.store.Put(w); err != nil {
+		return w, err
+	}
+	c.audit(actor, action, id, detail, ResultOK)
+	return w, nil
+}
+
+// InvalidateEndpoint makes the next request recheck runtime health after a proxy
+// failure. The failed business request itself is never replayed.
+func (c *Controller) InvalidateEndpoint(id, endpoint string) {
+	s := c.slot(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.endpoint == endpoint {
+		s.endpoint, s.readyUntil = "", time.Time{}
+	}
+}
+
+// Lease protects work which continues after an HTTP response or disconnection.
+// Agents must renew their lease before expiration. Leases survive a restart.
+func (c *Controller) Lease(actor, id, token string, ttl time.Duration) (string, error) {
+	if ttl <= 0 || ttl > time.Hour {
+		return "", fmt.Errorf("%w: lease ttl must be in (0, 3600] seconds", ErrInvalid)
+	}
+	s := c.slot(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w, err := c.store.Get(id)
+	if err != nil {
+		return "", err
+	}
+	now := c.now()
+	if w.Desired == DesiredSuspended || w.expired(now) {
+		return "", ErrExpired
+	}
+	if w.Desired != DesiredRunning {
+		return "", ErrConflict
+	}
+	if token != "" {
+		expires, ok := w.Leases[token]
+		if !ok || !now.Before(expires) {
+			return "", ErrNotFound
+		}
+	} else {
+		if len(w.Leases) >= 256 {
+			for k, expires := range w.Leases {
+				if !now.Before(expires) {
+					delete(w.Leases, k)
+				}
+			}
+			if len(w.Leases) >= 256 {
+				return "", ErrConflict
+			}
+		}
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		token = hex.EncodeToString(b)
+	}
+	w.Leases[token] = now.Add(ttl)
+	w.LastActivity, w.UpdatedAt = now, now
+	if err := c.store.Put(w); err != nil {
+		return "", err
+	}
+	c.audit(actor, ActionLeaseAcquire, id, "ttl="+ttl.String(), ResultOK)
+	return token, nil
+}
+
+func (c *Controller) ReleaseLease(actor, id, token string) error {
+	s := c.slot(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w, err := c.store.Get(id)
+	if err != nil {
+		return err
+	}
+	if _, ok := w.Leases[token]; !ok {
+		return ErrNotFound
+	}
+	delete(w.Leases, token)
+	w.LastActivity, w.UpdatedAt = c.now(), c.now()
+	if err := c.store.Put(w); err != nil {
+		return err
+	}
+	c.audit(actor, ActionLeaseRelease, id, "", ResultOK)
+	return nil
+}
+
+// Acquire marks activity before starting or probing the runtime. The caller
+// holds the activity reference through the entire upstream response (SSE/WS too).
+func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), error) {
+	s := c.slot(id)
+	s.mu.Lock()
+	w, err := c.store.Get(id)
+	if err == nil && w.Desired == DesiredDeleted {
+		err = ErrConflict
+	}
+	if err == nil && (w.Desired == DesiredSuspended || w.expired(c.now())) {
+		err = ErrExpired
+	}
+	if err == nil {
+		w.Desired, w.LastActivity, w.UpdatedAt = DesiredRunning, c.now(), c.now()
+		err = c.store.Put(w)
+	}
+	if err != nil {
+		s.mu.Unlock()
+		return "", nil, err
+	}
+	s.active++
+	s.mu.Unlock()
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.active--
+			latest, err := c.store.Get(id)
+			if err == nil {
+				latest.LastActivity, latest.UpdatedAt = c.now(), c.now()
+				err = c.store.Put(latest)
+			}
+			if err != nil {
+				slog.Error("persist request activity", "workspace", id, "error", err)
+			}
+		})
+	}
+	ticker := time.NewTicker(c.PollInterval)
+	defer ticker.Stop()
+	for {
+		endpoint, err := c.Reconcile(ctx, id)
+		if err != nil {
+			release()
+			return "", nil, err
+		}
+		if endpoint != "" {
+			return endpoint, release, nil
+		}
+		select {
+		case <-ctx.Done():
+			release()
+			return "", nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// reclaimDecision 只报告调用方必须知道的两件事：状态是否变了（要落盘），以及
+// 这次删除是不是宽限期到了才发生的（审计要区分触发者）。审计本身在转移发生的
+// 地方就地记录。
+type reclaimDecision struct {
+	changed     bool
+	graceDelete bool
+}
+
+// Reconcile is the only place which talks to the runtime. It enforces the whole
+// lifecycle in one pass: reconcile the desired state, stop idle workspaces,
+// suspend expired ones and hard delete those whose grace period has passed.
+func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string, err error) {
+	c.Metrics.Reconciles.Add(1)
+	defer func() {
+		if err != nil {
+			c.Metrics.ReconcileErrors.Add(1)
+		}
+	}()
+	s := c.slot(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	w, err := c.store.Get(id)
+	if err != nil {
+		return "", err
+	}
+	if w.Phase == PhaseDeleted {
+		return "", nil
+	}
+	p, ok := c.profiles[w.Profile]
+	if !ok {
+		return "", fmt.Errorf("unknown persisted profile %q", w.Profile)
+	}
+	now := c.now()
+	decision := c.reclaim(&w, now, s.active > 0 || hasLease(w, now))
+	if decision.changed {
+		// Persist reclamation intent before touching the runtime: a crash here
+		// leaves a workspace which the next round reclaims again, instead of one
+		// which looks running while its workload is already gone.
+		if err := c.store.Put(w); err != nil {
+			return "", err
+		}
+	}
+	if w.Desired == DesiredRunning && s.endpoint != "" && now.Before(s.readyUntil) {
+		return s.endpoint, nil
+	}
+	s.endpoint, s.readyUntil = "", time.Time{}
+	opCtx, cancel := context.WithTimeout(ctx, c.OperationTimeout)
+	defer cancel()
+	previous := w.Phase
+	switch w.Desired {
+	case DesiredRunning:
+		var obs Observation
+		obs, err = c.runtime.Observe(opCtx, w, p)
+		if err == nil && !obs.Ready {
+			err = c.runtime.Ensure(opCtx, w, p)
+		}
+		if err == nil && w.RestartPending {
+			// Ensure first: the workspace may be brand new or scaled to zero, and
+			// restarting a Deployment which does not exist yet would fail.
+			if err = c.runtime.Restart(opCtx, w); err == nil {
+				w.RestartPending, w.Phase = false, PhaseStarting
+			}
+			break
+		}
+		w.Phase = PhaseStarting
+		if err == nil && obs.Ready {
+			w.Phase, endpoint = PhaseRunning, obs.Endpoint
+		}
+	case DesiredStopped:
+		err = c.runtime.Stop(opCtx, w)
+		w.Phase = PhaseStopped
+	case DesiredSuspended:
+		// Suspension stops the workload but never its storage.
+		err = c.runtime.Stop(opCtx, w)
+		w.Phase = PhaseSuspended
+	case DesiredDeleted:
+		err = c.runtime.Delete(opCtx, w)
+		w.Phase = PhaseDeleted
+	default:
+		return "", fmt.Errorf("invalid persisted desired state %q", w.Desired)
+	}
+	w.LastError = ""
+	if err != nil {
+		w.Phase, w.LastError = PhaseError, err.Error()
+	}
+	w.UpdatedAt = now
+	if saveErr := c.store.Put(w); saveErr != nil {
+		return "", saveErr
+	}
+	c.recordCompletion(w, previous, decision, err)
+	if endpoint != "" && err == nil {
+		s.endpoint, s.readyUntil = endpoint, c.now().Add(runtimeReadyTTL)
+	}
+	return endpoint, err
+}
+
+// reclaim advances both reclamation chains in one pass and reports what it did.
+// Everything here is intent only: the caller persists it and then runs the
+// runtime action, so a crash in between is retried rather than lost.
+func (c *Controller) reclaim(w *Workspace, now time.Time, busy bool) reclaimDecision {
+	decision := reclaimDecision{}
+	if w.Desired == DesiredRunning && !busy &&
+		now.Sub(w.LastActivity) >= c.IdleTimeout && now.Sub(c.started) >= c.IdleTimeout {
+		idle := now.Sub(w.LastActivity).Round(time.Second)
+		w.Desired, w.UpdatedAt = DesiredStopped, now
+		c.Metrics.IdleStops.Add(1)
+		c.audit(ActorSystem, ActionIdleStop, w.ID, "idle for "+idle.String()+", volume retained", ResultOK)
+		decision.changed = true
+	}
+	// 空闲缩容之后立刻判过期：同一轮里 stopped -> suspended 是合法的连续转移。
+	expiry := c.applyExpiry(w, now, busy)
+	decision.changed = decision.changed || expiry.changed
+	decision.graceDelete = expiry.graceDelete
+	return decision
+}
+
+// applyExpiry drives running/stopped --deadline--> suspended --grace--> deleted.
+// Reclamation only advances while the workspace is idle: a deadline does not
+// justify cutting off a live request or a leased background task, and deferring
+// loses nothing because the deadline stays in the past. Reclamation is skipped
+// entirely during the startup grace period.
+func (c *Controller) applyExpiry(w *Workspace, now time.Time, busy bool) reclaimDecision {
+	if now.Sub(c.started) < c.StartupGrace {
+		return reclaimDecision{}
+	}
+	switch w.Desired {
+	case DesiredRunning, DesiredStopped:
+		if !w.expired(now) || busy {
+			return reclaimDecision{}
+		}
+		deadline := w.ExpiresAt.UTC().Format(time.RFC3339)
+		w.Desired, w.SuspendedAt, w.UpdatedAt = DesiredSuspended, now, now
+		c.Metrics.Expirations.Add(1)
+		c.audit(ActorSystem, ActionExpire, w.ID, "deadline "+deadline+" passed, volume retained", ResultOK)
+		return reclaimDecision{changed: true}
+	case DesiredSuspended:
+		if busy || w.SuspendedAt.IsZero() || now.Sub(w.SuspendedAt) < c.GracePeriod {
+			return reclaimDecision{}
+		}
+		w.Desired, w.UpdatedAt, w.DeletionReason = DesiredDeleted, now, DeletedByGrace
+		return reclaimDecision{changed: true, graceDelete: true}
+	}
+	return reclaimDecision{}
+}
+
+// recordCompletion audits the runtime side of a state change. Failures are
+// recorded once per failure streak, not once per round, so a backend outage
+// does not flood the audit log.
+func (c *Controller) recordCompletion(w Workspace, previous string, decision reclaimDecision, err error) {
+	switch w.Desired {
+	case DesiredSuspended:
+		if err != nil {
+			if previous != PhaseError {
+				c.audit(ActorSystem, ActionSuspend, w.ID, "scale to zero failed: "+err.Error(), ResultError)
+			}
+			return
+		}
+		if previous == PhaseSuspended {
+			return
+		}
+		c.Metrics.Suspensions.Add(1)
+		c.audit(ActorSystem, ActionSuspend, w.ID, "workload scaled to zero, volume retained", ResultOK)
+	case DesiredDeleted:
+		if err != nil {
+			if previous != PhaseError {
+				c.audit(ActorSystem, ActionHardDelete, w.ID, "delete failed: "+err.Error(), ResultError)
+			}
+			return
+		}
+		if previous == PhaseDeleted {
+			return
+		}
+		// 触发者从持久化的记录里读，而不是从这一轮的决策里读：删除失败重试
+		// 之后，宽限期这次转移已经不在内存里了。
+		trigger := "user-requested"
+		if w.DeletionReason == DeletedByGrace || decision.graceDelete {
+			trigger = "grace period elapsed"
+		}
+		c.Metrics.HardDeletes.Add(1)
+		c.audit(ActorSystem, ActionHardDelete, w.ID, trigger+", deployment, service and pvc removed", ResultOK)
+	}
+}
+
+// Ready reports whether the compute backend is reachable. Liveness and
+// readiness are deliberately separate: a controller which cannot reach the API
+// should be taken out of rotation, not restarted. Probe results are cached
+// briefly so a fast prober does not turn into load on the API server.
+func (c *Controller) Ready(ctx context.Context) error {
+	c.readyMu.Lock()
+	defer c.readyMu.Unlock()
+	if c.now().Before(c.readyAt) {
+		return c.readyErr
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, c.ProbeTimeout)
+	defer cancel()
+	err := c.runtime.Probe(probeCtx)
+	c.readyErr, c.readyAt = err, c.now().Add(c.ReadyTTL)
+	return err
+}
+
+// audit appends an audit event. A failed append neither rolls back the action
+// nor disappears: the two writes are not transactional, so the caller has to be
+// able to notice the gap through the error log and the failure counter.
+func (c *Controller) audit(actor, action, workspace, detail, result string) {
+	if actor == "" {
+		actor = ActorUnknown
+	}
+	event := AuditEvent{At: c.now(), Actor: actor, Action: action, Workspace: workspace, Detail: detail, Result: result}
+	if err := c.store.Audit().Append(event); err != nil {
+		c.Metrics.AuditFailures.Add(1)
+		slog.Error("append audit event", "action", action, "workspace", workspace, "error", err)
+	}
+}
+
+func desiredAction(desired string) string {
+	switch desired {
+	case DesiredRunning:
+		return ActionStart
+	case DesiredStopped:
+		return ActionStop
+	default:
+		return ActionDelete
+	}
+}
+
+func formatDeadline(at time.Time) string {
+	if at.IsZero() {
+		return "none"
+	}
+	return at.UTC().Format(time.RFC3339)
+}
