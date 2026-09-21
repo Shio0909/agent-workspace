@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-workspace-controller
+  namespace: agent-workspace
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-workspace-controller
+  namespace: agent-workspace
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-workspace-controller
+  namespace: agent-workspace
+subjects:
+  - kind: ServiceAccount
+    name: agent-workspace-controller
+    namespace: agent-workspace
+roleRef:
+  kind: Role
+  name: agent-workspace-controller
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-workspace-state
+  namespace: agent-workspace
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-workspace-controller
+  namespace: agent-workspace
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-workspace-controller
+  template:
+    metadata:
+      labels:
+        app: agent-workspace-controller
+    spec:
+      serviceAccountName: agent-workspace-controller
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: controller
+          image: agent-workspace:local
+          imagePullPolicy: IfNotPresent
+          args: ["-listen", "0.0.0.0:8090", "-data", "/data", "-profiles", "/etc/agent-workspace/profiles.json", "-idle", "2m", "-grace", "24h", "-startup-grace", "1m"]
+          ports:
+            - containerPort: 8090
+          env:
+            - name: AGENT_WORKSPACE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agent-workspace-auth
+                  key: token
+          # 存活与就绪分开：连不上 API Server 只摘流量，不重启进程。
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8090
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - name: state
+              mountPath: /data
+            - name: profiles
+              mountPath: /etc/agent-workspace
+              readOnly: true
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: agent-workspace-state
+        - name: profiles
+          configMap:
+            name: agent-workspace-profiles
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-workspace-controller
+  namespace: agent-workspace
+spec:
+  selector:
+    app: agent-workspace-controller
+  ports:
+    - port: 8090
+      targetPort: 8090
