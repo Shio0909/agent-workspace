@@ -1,0 +1,11 @@
+{
+  "demo": {
+    "image": "agent-workspace-demo:local",
+    "port": 8080,
+    "health_path": "/health",
+    "mount_path": "/workspace",
+    "storage": "1Gi",
+    "cpu": "1",
+    "memory": "256Mi"
+  }
+}
