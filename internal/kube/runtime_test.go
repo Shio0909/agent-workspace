@@ -172,3 +172,132 @@ func TestProbeUsesAPIServer(t *testing.T) {
 		t.Fatal("unreachable API server reported ready")
 	}
 }
+
+func deploymentActions(client *fake.Clientset, verb string) int {
+	n := 0
+	for _, a := range client.Actions() {
+		if a.GetVerb() == verb && a.GetResource().Resource == "deployments" {
+			n++
+		}
+	}
+	return n
+}
+
+func TestEnsureAfterRestartKeepsTheRestartAndSkipsUnchangedSpecs(t *testing.T) {
+	w := control.Workspace{ID: "demo"}
+	client := fake.NewSimpleClientset()
+	r := Runtime{Namespace: "agent-workspace", Client: client}
+	ctx := context.Background()
+	if err := r.Ensure(ctx, w, profile()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Restart(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	restarted, _ := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{})
+	at := restarted.Spec.Template.Annotations[restartedAtLabel]
+	updates := deploymentActions(client, "update")
+	for i := 0; i < 5; i++ {
+		if err := r.Ensure(ctx, w, profile()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{})
+	if got.Spec.Template.Annotations[restartedAtLabel] != at {
+		t.Fatalf("Ensure undid the restart: %q -> %q", at, got.Spec.Template.Annotations[restartedAtLabel])
+	}
+	if n := deploymentActions(client, "update") - updates; n != 0 {
+		t.Fatalf("unchanged spec was rewritten %d times", n)
+	}
+}
+
+func TestEnsureScalesStoppedWorkspaceBackUpWithoutTouchingTheTemplate(t *testing.T) {
+	w := control.Workspace{ID: "demo"}
+	client := fake.NewSimpleClientset()
+	r := Runtime{Namespace: "agent-workspace", Client: client}
+	ctx := context.Background()
+	if err := r.Ensure(ctx, w, profile()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Restart(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Stop(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{})
+	if err := r.Ensure(ctx, w, profile()); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{})
+	if after.Spec.Replicas == nil || *after.Spec.Replicas != 1 {
+		t.Fatalf("replicas=%v, want 1", after.Spec.Replicas)
+	}
+	if after.Spec.Template.Annotations[restartedAtLabel] != before.Spec.Template.Annotations[restartedAtLabel] {
+		t.Fatal("scaling up changed the pod template")
+	}
+}
+
+func TestEnsureRewritesTheSpecWhenTheProfileChanges(t *testing.T) {
+	w := control.Workspace{ID: "demo"}
+	client := fake.NewSimpleClientset()
+	r := Runtime{Namespace: "agent-workspace", Client: client}
+	ctx := context.Background()
+	if err := r.Ensure(ctx, w, profile()); err != nil {
+		t.Fatal(err)
+	}
+	p := profile()
+	p.Image = "demo:v2"
+	if err := r.Ensure(ctx, w, p); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{})
+	if got.Spec.Template.Spec.Containers[0].Image != "demo:v2" {
+		t.Fatal("profile change was not applied")
+	}
+}
+
+func TestBuildObjectsIsDeterministic(t *testing.T) {
+	p := profile()
+	p.Env = map[string]string{"A": "1", "B": "2", "C": "3", "D": "4", "E": "5"}
+	w := control.Workspace{ID: "demo"}
+	_, first, _, err := BuildObjects(w, p, "agent-workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		_, next, _, err := BuildObjects(w, p, "agent-workspace")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next.Annotations[specHashAnnotation] != first.Annotations[specHashAnnotation] {
+			t.Fatal("the same profile produced different pod templates")
+		}
+	}
+	env := first.Spec.Template.Spec.Containers[0].Env
+	for i := 1; i < len(env)-1; i++ {
+		if env[i-1].Name > env[i].Name {
+			t.Fatalf("env is not sorted: %v", env)
+		}
+	}
+}
+
+func TestValidateProfileRejectsMalformedQuantities(t *testing.T) {
+	for _, mutate := range []func(*control.Profile){
+		func(p *control.Profile) { p.CPU = "one" },
+		func(p *control.Profile) { p.Memory = "lots" },
+		func(p *control.Profile) { p.Storage = "1 Gi" },
+	} {
+		p := profile()
+		mutate(&p)
+		if err := ValidateProfile(p); !errors.Is(err, control.ErrInvalid) {
+			t.Fatalf("accepted %+v: %v", p, err)
+		}
+		if _, _, _, err := BuildObjects(control.Workspace{ID: "demo"}, p, "agent-workspace"); err == nil {
+			t.Fatal("BuildObjects accepted a malformed quantity")
+		}
+	}
+	if err := ValidateProfile(profile()); err != nil {
+		t.Fatal(err)
+	}
+}
