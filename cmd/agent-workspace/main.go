@@ -94,6 +94,9 @@ func run() error {
 		defer close(loopDone)
 		scheduler.Run(ctx)
 	}()
+	// 事件驱动对账：工作区一变就对账，并唤醒正在等待它的请求。没有运行时
+	// 事件源时它仍然立即执行意图变更（start/stop/delete 不再等下一轮扫描）。
+	go c.StartEvents(ctx)
 	api := &httpapi.Server{Controller: c, Token: cfg.token, Actor: "api"}
 	server := &http.Server{Addr: cfg.listen, Handler: api.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	serverErr := make(chan error, 1)

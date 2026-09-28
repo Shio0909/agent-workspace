@@ -21,6 +21,10 @@ type Metrics struct {
 	OperationReplays   atomic.Int64
 	OperationTakeovers atomic.Int64
 	AuditFailures      atomic.Int64
+	EventReconciles    atomic.Int64
+	// EventReconcileErrors 只统计事件通道里的失败；周期调度的失败已经由
+	// ReconcileErrors 覆盖。
+	EventReconcileErrors atomic.Int64
 }
 
 // WriteMetrics 以 Prometheus 文本格式导出指标。手写而不是引入客户端库：这里
@@ -56,6 +60,8 @@ func (c *Controller) WriteMetrics(out io.Writer) error {
 	writeValue(&b, "nc_operation_replays_total", "Submissions which reused an existing biz_id.", "counter", m.OperationReplays.Load())
 	writeValue(&b, "nc_operation_takeovers_total", "Stale processing records taken over by a later submission.", "counter", m.OperationTakeovers.Load())
 	writeValue(&b, "nc_audit_failures_total", "Audit events which could not be persisted.", "counter", m.AuditFailures.Load())
+	writeValue(&b, "nc_event_reconciles_total", "Reconciles triggered by runtime events or intent changes.", "counter", m.EventReconciles.Load())
+	writeValue(&b, "nc_event_reconcile_failures_total", "Event-driven reconciles which failed and were requeued with backoff.", "counter", m.EventReconcileErrors.Load())
 	// 运行时可附带自己的指标（比如对 API server 的请求数），用来证明缓存
 	// 省掉了多少调用。
 	if exporter, ok := c.runtime.(MetricsExporter); ok {
