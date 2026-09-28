@@ -16,9 +16,18 @@ type slot struct {
 	active     int
 	endpoint   string
 	readyUntil time.Time
+	// activity is the newest request activity, kept in memory so the request
+	// path never waits for an fsync. It is merged into the persisted
+	// LastActivity at most once per ActivityFlushInterval, and on shutdown.
+	activity time.Time
 }
 
 const runtimeReadyTTL = 5 * time.Second
+
+// DefaultActivityFlushInterval bounds how much request activity a crash can
+// lose. Losing it is safe: after a restart, idle reclamation is held back for a
+// full IdleTimeout (see reclaim), which is far longer than this interval.
+const DefaultActivityFlushInterval = 10 * time.Second
 
 type Controller struct {
 	store            *Store
@@ -41,6 +50,12 @@ type Controller struct {
 	// 缓存时长，避免频繁探针变成对后端 API 的压测。
 	ProbeTimeout time.Duration
 	ReadyTTL     time.Duration
+	// DisableReadyCache forces every request through the readiness probe. It is used only for controlled benchmarks.
+	DisableReadyCache bool
+	// ActivityFlushInterval is how stale the persisted LastActivity may get
+	// while requests keep arriving. Zero persists every request, which is the
+	// original behaviour and is kept for controlled benchmarks.
+	ActivityFlushInterval time.Duration
 	// Metrics 由 New 初始化，控制器内部只做原子自增。
 	Metrics *Metrics
 
@@ -56,7 +71,8 @@ func New(store *Store, runtime Runtime, profiles map[string]Profile, idle time.D
 		IdleTimeout: idle, OperationTimeout: time.Minute, PollInterval: time.Second,
 		GracePeriod: 24 * time.Hour, StartupGrace: time.Minute, OperationLease: 10 * time.Minute,
 		ProbeTimeout: 3 * time.Second, ReadyTTL: 2 * time.Second,
-		Metrics: &Metrics{}, now: time.Now, started: time.Now()}
+		ActivityFlushInterval: DefaultActivityFlushInterval,
+		Metrics:               &Metrics{}, now: time.Now, started: time.Now()}
 }
 
 func (c *Controller) slot(id string) *slot {
@@ -64,8 +80,75 @@ func (c *Controller) slot(id string) *slot {
 	return s.(*slot)
 }
 
-func (c *Controller) Get(id string) (Workspace, error) { return c.store.Get(id) }
-func (c *Controller) List() []Workspace                { return c.store.List() }
+// withActivity overlays unflushed request activity so readers never see an
+// older LastActivity than the controller itself uses.
+func (c *Controller) withActivity(w Workspace) Workspace {
+	if v, ok := c.slots.Load(w.ID); ok {
+		s := v.(*slot)
+		s.mu.Lock()
+		mergeActivity(s, &w)
+		s.mu.Unlock()
+	}
+	return w
+}
+
+func (c *Controller) Get(id string) (Workspace, error) {
+	w, err := c.store.Get(id)
+	if err != nil {
+		return w, err
+	}
+	return c.withActivity(w), nil
+}
+
+func (c *Controller) List() []Workspace {
+	items := c.store.List()
+	for i := range items {
+		items[i] = c.withActivity(items[i])
+	}
+	return items
+}
+
+// touch records request activity. The caller must hold s.mu. It persists only
+// when the stored value is older than ActivityFlushInterval, so a busy
+// workspace costs one snapshot write per interval instead of two per request.
+func (c *Controller) touch(s *slot, w *Workspace, now time.Time) error {
+	if now.After(s.activity) {
+		s.activity = now
+	}
+	if s.activity.Sub(w.LastActivity) < c.ActivityFlushInterval {
+		return nil
+	}
+	w.LastActivity, w.UpdatedAt = s.activity, now
+	return c.store.Put(*w)
+}
+
+// mergeActivity folds unflushed activity into w. The caller must hold s.mu.
+func mergeActivity(s *slot, w *Workspace) {
+	if s.activity.After(w.LastActivity) {
+		w.LastActivity = s.activity
+	}
+}
+
+// FlushActivity persists all unflushed request activity. It is called on
+// graceful shutdown; a crash skips it, which the restart grace tolerates.
+func (c *Controller) FlushActivity() error {
+	var errs []error
+	c.slots.Range(func(key, value any) bool {
+		s := value.(*slot)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		w, err := c.store.Get(key.(string))
+		if err != nil || !s.activity.After(w.LastActivity) {
+			return true
+		}
+		w.LastActivity = s.activity
+		if err := c.store.Put(w); err != nil {
+			errs = append(errs, err)
+		}
+		return true
+	})
+	return errors.Join(errs...)
+}
 
 // Scan 返回按 ID 排序的一页工作区，more 表示后面还有。调度循环用它分批推进，
 // 而不是一次把整个快照展开成工作集。
@@ -310,8 +393,15 @@ func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), er
 		err = ErrExpired
 	}
 	if err == nil {
-		w.Desired, w.LastActivity, w.UpdatedAt = DesiredRunning, c.now(), c.now()
-		err = c.store.Put(w)
+		now := c.now()
+		if w.Desired != DesiredRunning {
+			// Waking a workspace changes intent, and intent is always durable.
+			s.activity = now
+			w.Desired, w.LastActivity, w.UpdatedAt = DesiredRunning, now, now
+			err = c.store.Put(w)
+		} else {
+			err = c.touch(s, &w, now)
+		}
 	}
 	if err != nil {
 		s.mu.Unlock()
@@ -327,10 +417,9 @@ func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), er
 			s.active--
 			latest, err := c.store.Get(id)
 			if err == nil {
-				latest.LastActivity, latest.UpdatedAt = c.now(), c.now()
-				err = c.store.Put(latest)
+				err = c.touch(s, &latest, c.now())
 			}
-			if err != nil {
+			if err != nil && !errors.Is(err, ErrNotFound) {
 				slog.Error("persist request activity", "workspace", id, "error", err)
 			}
 		})
@@ -391,7 +480,15 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 		return "", fmt.Errorf("unknown persisted profile %q", w.Profile)
 	}
 	now := c.now()
+	persisted := w.LastActivity
+	mergeActivity(s, &w)
 	decision := c.reclaim(&w, now, s.active > 0 || hasLease(w, now))
+	if !decision.changed && w.LastActivity.Sub(persisted) >= c.ActivityFlushInterval && w.LastActivity.After(persisted) {
+		// Periodic flush for workspaces which stay busy: the scheduler visits
+		// every workspace each round, so persisted activity never lags by more
+		// than one interval plus one round.
+		decision.changed = true
+	}
 	if decision.changed {
 		// Persist reclamation intent before touching the runtime: a crash here
 		// leaves a workspace which the next round reclaims again, instead of one
@@ -400,7 +497,7 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 			return "", err
 		}
 	}
-	if w.Desired == DesiredRunning && s.endpoint != "" && now.Before(s.readyUntil) {
+	if !c.DisableReadyCache && w.Desired == DesiredRunning && s.endpoint != "" && now.Before(s.readyUntil) {
 		return s.endpoint, nil
 	}
 	s.endpoint, s.readyUntil = "", time.Time{}
