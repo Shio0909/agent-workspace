@@ -3,11 +3,14 @@ package kube
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"time"
 
 	"agent-workspace/internal/control"
@@ -29,6 +32,7 @@ const (
 	managedByValue       = "agent-workspace"
 	workspaceLabel       = "agent-workspace/workspace"
 	restartedAtLabel     = "agent-workspace/restartedAt"
+	specHashAnnotation   = "agent-workspace/spec-hash"
 	defaultClusterDomain = "cluster.local"
 )
 
@@ -180,7 +184,31 @@ func (r *Runtime) ensureDeployment(ctx context.Context, desired *appsv1.Deployme
 	if !owns(current.Labels, w) {
 		return fmt.Errorf("refusing unmanaged deployment %s", desired.Name)
 	}
+	hash := desired.Annotations[specHashAnnotation]
+	if current.Annotations[specHashAnnotation] == hash {
+		// The template is already what we want. Ensure runs on every poll while a
+		// workspace starts, so rewriting an unchanged spec would only add API
+		// writes; scaling back from zero is the one field that may still differ.
+		if current.Spec.Replicas != nil && *current.Spec.Replicas == *desired.Spec.Replicas {
+			return nil
+		}
+		current.Spec.Replicas = desired.Spec.Replicas
+		_, err = client.AppsV1().Deployments(r.Namespace).Update(ctx, current, metav1.UpdateOptions{})
+		return err
+	}
+	// A restart is recorded on the live template. Replacing the spec without it
+	// would change the template again and trigger a second rollout.
+	if at := current.Spec.Template.Annotations[restartedAtLabel]; at != "" {
+		if desired.Spec.Template.Annotations == nil {
+			desired.Spec.Template.Annotations = map[string]string{}
+		}
+		desired.Spec.Template.Annotations[restartedAtLabel] = at
+	}
 	current.Spec = desired.Spec
+	if current.Annotations == nil {
+		current.Annotations = map[string]string{}
+	}
+	current.Annotations[specHashAnnotation] = hash
 	_, err = client.AppsV1().Deployments(r.Namespace).Update(ctx, current, metav1.UpdateOptions{})
 	return err
 }
@@ -201,10 +229,33 @@ func (r *Runtime) ensureService(ctx context.Context, desired *corev1.Service, w 
 	if !owns(current.Labels, w) {
 		return fmt.Errorf("refusing unmanaged service %s", desired.Name)
 	}
+	if sameServiceShape(current, desired) {
+		return nil
+	}
 	current.Spec.Ports = desired.Spec.Ports
 	current.Spec.Selector = desired.Spec.Selector
 	_, err = client.CoreV1().Services(r.Namespace).Update(ctx, current, metav1.UpdateOptions{})
 	return err
+}
+
+// sameServiceShape compares only the fields this controller sets, because the
+// API server fills in defaults such as protocol and cluster IP.
+func sameServiceShape(current, desired *corev1.Service) bool {
+	if len(current.Spec.Ports) != len(desired.Spec.Ports) || len(current.Spec.Selector) != len(desired.Spec.Selector) {
+		return false
+	}
+	for k, v := range desired.Spec.Selector {
+		if current.Spec.Selector[k] != v {
+			return false
+		}
+	}
+	for i, want := range desired.Spec.Ports {
+		got := current.Spec.Ports[i]
+		if got.Name != want.Name || got.Port != want.Port || got.TargetPort != want.TargetPort {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Runtime) Restart(ctx context.Context, w control.Workspace) error {
@@ -343,11 +394,12 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 	if !control.ValidName(w.ID) || !control.ValidName(namespace) {
 		return nil, nil, nil, control.ErrInvalid
 	}
-	if err := p.Validate(); err != nil {
+	if err := ValidateProfile(p); err != nil {
 		return nil, nil, nil, err
 	}
+	q := quantities(p)
 	meta := metav1.ObjectMeta{Name: name(w), Namespace: namespace, Labels: labels(w)}
-	storage := resource.MustParse(p.Storage)
+	storage := q.storage
 	pvc := &corev1.PersistentVolumeClaim{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeClaim"},
 		ObjectMeta: meta,
@@ -357,9 +409,16 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 		},
 	}
 
+	// Map iteration order is random. An unsorted env list would change the pod
+	// template on every build, and every template change is a rollout.
+	keys := make([]string, 0, len(p.Env))
+	for k := range p.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	env := make([]corev1.EnvVar, 0, len(p.Env)+1)
-	for k, v := range p.Env {
-		env = append(env, corev1.EnvVar{Name: k, Value: v})
+	for _, k := range keys {
+		env = append(env, corev1.EnvVar{Name: k, Value: p.Env[k]})
 	}
 	env = append(env, corev1.EnvVar{Name: "WORKSPACE_ID", Value: w.ID})
 	mounts := []corev1.VolumeMount{{Name: "workspace", MountPath: p.MountPath}}
@@ -385,8 +444,8 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 				corev1.ResourceMemory: resource.MustParse("128Mi"),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(p.CPU),
-				corev1.ResourceMemory: resource.MustParse(p.Memory),
+				corev1.ResourceCPU:    q.cpu,
+				corev1.ResourceMemory: q.memory,
 			},
 		},
 		ReadinessProbe: &corev1.Probe{
@@ -426,6 +485,11 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 			},
 		},
 	}
+	hash, err := specHash(deployment.Spec)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	deployment.ObjectMeta.Annotations = map[string]string{specHashAnnotation: hash}
 	service := &corev1.Service{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
 		ObjectMeta: meta,
@@ -435,6 +499,45 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 		},
 	}
 	return pvc, deployment, service, nil
+}
+
+type profileQuantities struct{ storage, cpu, memory resource.Quantity }
+
+// quantities must only be called after ValidateProfile succeeded.
+func quantities(p control.Profile) profileQuantities {
+	return profileQuantities{
+		storage: resource.MustParse(p.Storage),
+		cpu:     resource.MustParse(p.CPU),
+		memory:  resource.MustParse(p.Memory),
+	}
+}
+
+// ValidateProfile adds the Kubernetes-specific checks to Profile.Validate. It
+// runs at startup so a malformed quantity fails fast instead of panicking
+// inside a reconcile goroutine.
+func ValidateProfile(p control.Profile) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	for field, raw := range map[string]string{"storage": p.Storage, "cpu": p.CPU, "memory": p.Memory} {
+		if _, err := resource.ParseQuantity(raw); err != nil {
+			return fmt.Errorf("%w: %s %q is not a Kubernetes quantity", control.ErrInvalid, field, raw)
+		}
+	}
+	return nil
+}
+
+// specHash fingerprints the replica-independent part of the Deployment spec.
+// It is stored on the Deployment itself, not on the pod template, so recording
+// it never causes a rollout.
+func specHash(spec appsv1.DeploymentSpec) (string, error) {
+	spec.Replicas = nil
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8]), nil
 }
 
 // Manifest returns the same objects as a Kubernetes List for diagnostics.

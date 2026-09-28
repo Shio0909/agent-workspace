@@ -186,7 +186,7 @@ func loadProfiles(path string) (map[string]control.Profile, error) {
 		if !control.ValidName(name) {
 			return nil, fmt.Errorf("invalid profile name %q", name)
 		}
-		if err := p.Validate(); err != nil {
+		if err := kube.ValidateProfile(p); err != nil {
 			return nil, fmt.Errorf("profile %s: %w", name, err)
 		}
 	}
