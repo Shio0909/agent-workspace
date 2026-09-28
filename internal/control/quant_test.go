@@ -641,9 +641,8 @@ func TestQuantSchedulerWithoutSemaphoreIsUnbounded(t *testing.T) {
 // TestQuantBoundedFanOutCostsWallClock 是并发上限的"代价"那一半：把运行时延迟
 // 拉长到成为主项，让"限流换到了什么"可以被计时。
 //
-// 注意口径：本机实测里，每次对账都要重写全量快照（Store.Put），那是一个全局
-// 串行点，所以无界版的耗时下界是"快照写入串行时间"而不是"运行时延迟"。两个
-// 数字都要连着这条口径一起读。
+// 注意口径：bbolt 写入已经降为单记录写入并由 group commit 合并 fsync，所以无界
+// 对照组的耗时主要反映运行时延迟和调度成本，不再是旧 JSON 快照的全量重写时间。
 func TestQuantBoundedFanOutCostsWallClock(t *testing.T) {
 	const (
 		workspaces = 64

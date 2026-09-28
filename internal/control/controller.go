@@ -27,6 +27,12 @@ type slot struct {
 
 const runtimeReadyTTL = 5 * time.Second
 
+var (
+	startPhaseObservationTimeout  = 2 * time.Second
+	startPhaseObservationInterval = 25 * time.Millisecond
+	startPhaseDirectTimeout       = time.Second
+)
+
 // DefaultActivityFlushInterval bounds how much request activity a crash can
 // lose. Losing it is safe: after a restart, idle reclamation is held back for a
 // full IdleTimeout (see reclaim), which is far longer than this interval.
@@ -62,12 +68,16 @@ type Controller struct {
 	// Metrics 由 New 初始化，控制器内部只做原子自增。
 	Metrics *Metrics
 
-	now      func() time.Time
-	started  time.Time
-	queue    *eventQueue
-	readyMu  sync.Mutex
-	readyErr error
-	readyAt  time.Time
+	now     func() time.Time
+	started time.Time
+	// startedAt 记录每次冷启动（进入 Starting）的真实时刻，只用真实时钟：
+	// pod 状况时间戳来自 API server，和测试用的假时钟混用会算出负耗时。
+	// 控制器重启会丢掉样本，冷启动指标是 best-effort，不影响行为。
+	startedAt sync.Map
+	queue     *eventQueue
+	readyMu   sync.Mutex
+	readyErr  error
+	readyAt   time.Time
 }
 
 func New(store *Store, runtime Runtime, profiles map[string]Profile, idle time.Duration) *Controller {
@@ -283,6 +293,9 @@ func (c *Controller) Restart(actor, id string) (Workspace, error) {
 		return w, err
 	}
 	s.endpoint, s.readyUntil = "", time.Time{}
+	// A restart is a cold start of the new pod: the breakdown is measured from
+	// here, not from the next round which already sees Phase=starting.
+	c.startedAt.Store(id, time.Now())
 	c.queue.Add(id)
 	c.audit(actor, ActionRestart, id, "workload replaced, volume retained", ResultOK)
 	return w, nil
@@ -401,6 +414,7 @@ func (c *Controller) ReleaseLease(actor, id, token string) error {
 // Acquire marks activity before starting or probing the runtime. The caller
 // holds the activity reference through the entire upstream response (SSE/WS too).
 func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), error) {
+	waitStart := time.Now()
 	s := c.slot(id)
 	s.mu.Lock()
 	w, err := c.store.Get(id)
@@ -457,6 +471,7 @@ func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), er
 			return "", nil, err
 		}
 		if endpoint != "" {
+			c.Metrics.AcquireWait.Observe(time.Since(waitStart).Seconds())
 			return endpoint, release, nil
 		}
 		select {
@@ -545,6 +560,11 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 		var obs Observation
 		obs, err = c.runtime.Observe(opCtx, w, p)
 		if err == nil && !obs.Ready {
+			// Record t0 before Ensure: the Deployment API call and scheduler can
+			// create and schedule a Pod before Ensure returns.
+			if w.Phase != PhaseStarting {
+				c.startedAt.LoadOrStore(w.ID, time.Now())
+			}
 			err = c.runtime.Ensure(opCtx, w, p)
 		}
 		if err == nil && w.RestartPending {
@@ -576,6 +596,12 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 	if err != nil {
 		w.Phase, w.LastError = PhaseError, err.Error()
 	}
+	if w.Phase == PhaseRunning && err == nil {
+		c.recordColdStart(opCtx, w)
+	} else if w.Phase == PhaseStopped || w.Phase == PhaseSuspended || w.Phase == PhaseDeleted {
+		// 没等到就绪就被显式停止：丢弃这次样本。错误重试保留 t0。
+		c.startedAt.LoadAndDelete(w.ID)
+	}
 	w.UpdatedAt = now
 	if saveErr := c.store.Put(w); saveErr != nil {
 		return "", saveErr
@@ -585,6 +611,46 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 		s.endpoint, s.readyUntil = endpoint, c.now().Add(runtimeReadyTTL)
 	}
 	return endpoint, err
+}
+
+// recordColdStart 把一次 starting->running 转移记录成冷启动耗时分解。这里全部
+// 用真实时钟：pod 状况的时间戳来自 API server，和 c.now 的测试替身不是同一
+// 个时钟。运行时没有 StartupObserver 能力（比如单测里的替身）时只记录总耗时。
+func (c *Controller) recordColdStart(ctx context.Context, w Workspace) {
+	v, ok := c.startedAt.LoadAndDelete(w.ID)
+	if !ok {
+		return
+	}
+	t0 := v.(time.Time)
+	c.Metrics.StartTotal.Observe(time.Since(t0).Seconds())
+	if obs, ok := c.runtime.(StartupObserver); ok {
+		go c.observeStartPhases(w, t0, obs)
+	}
+}
+
+func (c *Controller) observeStartPhases(w Workspace, t0 time.Time, obs StartupObserver) {
+	deadline := time.Now().Add(startPhaseObservationTimeout)
+	for {
+		allowDirect := !time.Now().Add(startPhaseObservationInterval).Before(deadline)
+		timeout := startPhaseObservationInterval
+		if allowDirect {
+			timeout = startPhaseDirectTimeout
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ts, found := obs.StartupTimestamps(ctx, w, allowDirect)
+		cancel()
+		if found && ts.Complete() {
+			c.Metrics.observeStartPhases(t0, ts)
+			return
+		}
+		if allowDirect {
+			if found {
+				c.Metrics.observeStartPhases(t0, ts)
+			}
+			return
+		}
+		time.Sleep(startPhaseObservationInterval)
+	}
 }
 
 // reclaim advances both reclamation chains in one pass and reports what it did.

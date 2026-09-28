@@ -5,11 +5,15 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
-// Metrics 是控制面的进程内计数。这里只放单调计数器；工作区、租约和幂等记录
-// 的数量在抓取时从快照算出来，避免同时维护两套会漂移的状态。New 保证它非 nil。
+// Metrics 是控制面的进程内计数。这里只放单调计数器和固定桶直方图；工作区、
+// 租约和幂等记录的数量在抓取时从快照算出来，避免同时维护两套会漂移的状态。
+// New 保证它非 nil。
 type Metrics struct {
 	Reconciles         atomic.Int64
 	ReconcileErrors    atomic.Int64
@@ -25,6 +29,133 @@ type Metrics struct {
 	// EventReconcileErrors 只统计事件通道里的失败；周期调度的失败已经由
 	// ReconcileErrors 覆盖。
 	EventReconcileErrors atomic.Int64
+	// AcquireWait 是请求等到可用 endpoint 的耗时（热路径接近 0，冷启动是
+	// 用户真实感知到的等待）。Start* 把冷启动按阶段拆开。
+	AcquireWait   Histogram
+	StartSchedule Histogram
+	StartPull     Histogram
+	StartReady    Histogram
+	StartTotal    Histogram
+}
+
+// histogramBuckets 覆盖从热路径（毫秒）到镜像拉取（分钟）的范围。
+var histogramBuckets = []float64{0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
+
+// Histogram 是固定桶的直方图。手写而不是引入 Prometheus 客户端，理由和
+// WriteMetrics 一样：零额外依赖，格式只有几行。
+type Histogram struct {
+	mu      sync.Mutex
+	buckets []uint64
+	count   uint64
+	sum     float64
+}
+
+// Observe 记录一次秒数。负数样本（时钟混乱）直接丢弃，不让它污染桶。
+func (h *Histogram) Observe(seconds float64) {
+	if seconds < 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.buckets == nil {
+		h.buckets = make([]uint64, len(histogramBuckets)+1)
+	}
+	h.buckets[sort.SearchFloat64s(histogramBuckets, seconds)]++
+	h.count++
+	h.sum += seconds
+}
+
+// writeTo 以 Prometheus 直方图格式输出。label 为空时不带标签。
+func (h *Histogram) writeTo(b *bytes.Buffer, name, help, label, value string) {
+	h.writeToWithHeader(b, name, help, label, value, true)
+}
+
+// writeSamplesTo writes one labelled series without repeating the histogram
+// family HELP/TYPE declarations, which must appear exactly once per family.
+func (h *Histogram) writeSamplesTo(b *bytes.Buffer, name, label, value string) {
+	h.writeToWithHeader(b, name, "", label, value, false)
+}
+
+func (h *Histogram) writeToWithHeader(b *bytes.Buffer, name, help, label, value string, header bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.buckets == nil {
+		h.buckets = make([]uint64, len(histogramBuckets)+1)
+	}
+	labels := ""
+	if label != "" {
+		labels = fmt.Sprintf("%s=%q,", label, value)
+	}
+	if header {
+		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
+	}
+	var cumulative uint64
+	for i, bound := range histogramBuckets {
+		cumulative += h.buckets[i]
+		fmt.Fprintf(b, "%s_bucket{%sle=%q} %d\n", name, labels, strconv.FormatFloat(bound, 'f', -1, 64), cumulative)
+	}
+	cumulative += h.buckets[len(histogramBuckets)]
+	fmt.Fprintf(b, "%s_bucket{%sle=\"+Inf\"} %d\n", name, labels, cumulative)
+	sum := strconv.FormatFloat(h.sum, 'f', -1, 64)
+	if labels == "" {
+		fmt.Fprintf(b, "%s_sum %s\n%s_count %d\n", name, sum, name, h.count)
+		return
+	}
+	fmt.Fprintf(b, "%s_sum{%s} %s\n", name, trimComma(labels), sum)
+	fmt.Fprintf(b, "%s_count{%s} %d\n", name, trimComma(labels), h.count)
+}
+
+func trimComma(s string) string {
+	if len(s) > 0 && s[len(s)-1] == ',' {
+		return s[:len(s)-1]
+	}
+	return s
+}
+
+// observeStartPhases 记录冷启动的分阶段耗时：调度、拉镜像+启动、就绪等待。
+// 只记录两端时间戳都存在的阶段，缺一个就跳过那一段而不是编造。
+func (m *Metrics) observeStartPhases(t0 time.Time, ts StartupTimestamps) {
+	if ts.Scheduled.IsZero() {
+		return
+	}
+	// Kubernetes condition timestamps are commonly second-granular while t0
+	// comes from time.Now. Truncate the base to avoid a same-second timestamp
+	// appearing to precede the start.
+	base := t0.Truncate(time.Second)
+	schedule, ok := phaseDuration(base, ts.Scheduled)
+	if !ok {
+		return
+	}
+	m.StartSchedule.Observe(schedule)
+	if ts.ContainerStarted.IsZero() {
+		return
+	}
+	pull, ok := phaseDuration(ts.Scheduled, ts.ContainerStarted)
+	if !ok {
+		return
+	}
+	m.StartPull.Observe(pull)
+	if ts.Ready.IsZero() {
+		return
+	}
+	ready, ok := phaseDuration(ts.ContainerStarted, ts.Ready)
+	if !ok {
+		return
+	}
+	m.StartReady.Observe(ready)
+}
+
+func phaseDuration(start, end time.Time) (float64, bool) {
+	delta := end.Sub(start)
+	if delta < 0 {
+		// Allow one second of negative skew because API timestamps are often
+		// truncated to whole seconds. Larger negative values indicate bad data.
+		if delta < -time.Second {
+			return 0, false
+		}
+		delta = 0
+	}
+	return delta.Seconds(), true
 }
 
 // WriteMetrics 以 Prometheus 文本格式导出指标。手写而不是引入客户端库：这里
@@ -62,6 +193,20 @@ func (c *Controller) WriteMetrics(out io.Writer) error {
 	writeValue(&b, "nc_audit_failures_total", "Audit events which could not be persisted.", "counter", m.AuditFailures.Load())
 	writeValue(&b, "nc_event_reconciles_total", "Reconciles triggered by runtime events or intent changes.", "counter", m.EventReconciles.Load())
 	writeValue(&b, "nc_event_reconcile_failures_total", "Event-driven reconciles which failed and were requeued with backoff.", "counter", m.EventReconcileErrors.Load())
+	m.AcquireWait.writeTo(&b, "nc_workspace_acquire_seconds", "Time a request waited for a ready endpoint, including cold starts.", "", "")
+	const startMetric = "nc_workspace_start_seconds"
+	fmt.Fprintf(&b, "# HELP %s Cold-start duration by phase, from pod condition timestamps.\n# TYPE %s histogram\n", startMetric, startMetric)
+	for _, phase := range []struct {
+		name string
+		h    *Histogram
+	}{
+		{"schedule", &m.StartSchedule},
+		{"pull", &m.StartPull},
+		{"ready", &m.StartReady},
+		{"total", &m.StartTotal},
+	} {
+		phase.h.writeSamplesTo(&b, startMetric, "phase", phase.name)
+	}
 	// 运行时可附带自己的指标（比如对 API server 的请求数），用来证明缓存
 	// 省掉了多少调用。
 	if exporter, ok := c.runtime.(MetricsExporter); ok {
