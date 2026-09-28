@@ -45,6 +45,7 @@ type config struct {
 	concurrency  int
 	readyCache   bool
 	activity     time.Duration
+	kubeCache    bool
 }
 
 func main() {
@@ -72,6 +73,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if cfg.kubeCache {
+		// 缓存不可用不是致命错误：不同步就退回直连 API server 的老路径。
+		if err := runtime.Start(ctx); err != nil {
+			slog.Warn("workload cache unavailable, falling back to direct API reads", "error", err)
+		}
+	}
 	c := control.New(store, runtime, profiles, cfg.idle)
 	c.GracePeriod, c.StartupGrace = cfg.grace, cfg.startupGrace
 	c.DisableReadyCache = !cfg.readyCache
@@ -80,8 +89,6 @@ func run() error {
 	scheduler.Interval, scheduler.RoundTimeout = cfg.interval, cfg.roundTimeout
 	scheduler.BatchSize, scheduler.Concurrency = cfg.batch, cfg.concurrency
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 	loopDone := make(chan struct{})
 	go func() {
 		defer close(loopDone)
@@ -136,6 +143,7 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.IntVar(&cfg.concurrency, "sweep-concurrency", 4, "workspaces reconciled concurrently")
 	fs.BoolVar(&cfg.readyCache, "ready-cache", true, "cache ready workspace endpoints")
 	fs.DurationVar(&cfg.activity, "activity-flush", control.DefaultActivityFlushInterval, "longest delay before request activity is persisted; 0 persists every request")
+	fs.BoolVar(&cfg.kubeCache, "kube-cache", true, "watch managed workloads and read runtime state from the local cache; false polls the API server (benchmark control)")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}

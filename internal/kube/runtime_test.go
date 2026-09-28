@@ -63,7 +63,7 @@ func profile() control.Profile {
 
 func ownedDeployment(w control.Workspace, replicas, ready int32) *appsv1.Deployment {
 	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: labels(w)},
+		ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: workspaceLabels(w)},
 		Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(replicas)},
 		Status:     appsv1.DeploymentStatus{Replicas: 0, ReadyReplicas: ready},
 	}
@@ -105,7 +105,7 @@ func TestManifestPreservesStorageAndSeparatesCredentials(t *testing.T) {
 func TestStopScalesToZeroAndKeepsPVC(t *testing.T) {
 	w := control.Workspace{ID: "demo"}
 	deployment := ownedDeployment(w, 1, 0)
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: labels(w)}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: workspaceLabels(w)}}
 	r := Runtime{Namespace: "agent-workspace", Client: fake.NewSimpleClientset(deployment, pvc)}
 	if err := r.Stop(context.Background(), w); err != nil {
 		t.Fatal(err)
@@ -134,7 +134,7 @@ func TestEnsureRefusesForeignResources(t *testing.T) {
 func TestRestartChangesPodTemplateAndPreservesReplicasAndPVC(t *testing.T) {
 	w := control.Workspace{ID: "demo"}
 	deployment := ownedDeployment(w, 1, 1)
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: labels(w)}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: workspaceLabels(w)}}
 	r := Runtime{Namespace: "agent-workspace", Client: fake.NewSimpleClientset(deployment, pvc)}
 	if err := r.Restart(context.Background(), w); err != nil {
 		t.Fatal(err)

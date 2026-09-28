@@ -56,6 +56,13 @@ func (c *Controller) WriteMetrics(out io.Writer) error {
 	writeValue(&b, "nc_operation_replays_total", "Submissions which reused an existing biz_id.", "counter", m.OperationReplays.Load())
 	writeValue(&b, "nc_operation_takeovers_total", "Stale processing records taken over by a later submission.", "counter", m.OperationTakeovers.Load())
 	writeValue(&b, "nc_audit_failures_total", "Audit events which could not be persisted.", "counter", m.AuditFailures.Load())
+	// 运行时可附带自己的指标（比如对 API server 的请求数），用来证明缓存
+	// 省掉了多少调用。
+	if exporter, ok := c.runtime.(MetricsExporter); ok {
+		if err := exporter.WriteMetrics(&b); err != nil {
+			return err
+		}
+	}
 	_, err := out.Write(b.Bytes())
 	return err
 }
