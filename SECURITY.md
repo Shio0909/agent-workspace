@@ -15,7 +15,7 @@ hardened for multi-tenant or untrusted-code workloads.
   mounting disabled, but this is not a sandbox guarantee.
 - There is no NetworkPolicy, Pod Security Admission, or egress restriction
   built in.
-- State is stored in a local JSON snapshot with a process lock. It is not a
+- State is stored in a local bbolt database with a process lock. It is not a
   multi-controller database.
 - TLS termination and rate limiting are expected to be provided by the
   surrounding deployment.
