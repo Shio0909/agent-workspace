@@ -29,6 +29,29 @@ const maxAuditLimit = 1000
 // maxActorLength 截断调用方自报的归属名，避免单条请求把审计日志撑大。
 const maxActorLength = 128
 
+// upstreamTransport is shared by every proxied request. http.DefaultTransport
+// keeps only two idle connections per host, and each workspace is one host, so
+// under concurrency most requests would open a fresh TCP connection and leave
+// one in TIME_WAIT when the pool overflows.
+var upstreamTransport http.RoundTripper = newUpstreamTransport()
+
+// maxConnsPerWorkspace caps upstream connections to one agent runtime. The idle
+// pool is exactly as large, so a returned connection is never closed while the
+// cap is in use; requests beyond the cap wait for a connection instead of
+// dialing, which is also backpressure for a single agent pod. Long-lived SSE or
+// WebSocket streams hold a connection each, so the cap bounds open streams per
+// workspace too.
+const maxConnsPerWorkspace = 512
+
+func newUpstreamTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 4096
+	t.MaxIdleConnsPerHost = maxConnsPerWorkspace
+	t.MaxConnsPerHost = maxConnsPerWorkspace
+	t.IdleConnTimeout = 90 * time.Second
+	return t
+}
+
 type Server struct {
 	Controller  *control.Controller
 	Token       string
@@ -281,9 +304,13 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		fail(w, errors.New("invalid runtime endpoint"))
 		return
 	}
+	transport := s.Transport
+	if transport == nil {
+		transport = upstreamTransport
+	}
 	proxy := &httputil.ReverseProxy{
 		FlushInterval: -1,
-		Transport:     s.Transport,
+		Transport:     transport,
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.Out.URL.Path = "/" + r.PathValue("path")
 			p.Out.URL.RawPath = ""
