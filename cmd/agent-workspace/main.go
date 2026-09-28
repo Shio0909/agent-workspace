@@ -43,6 +43,8 @@ type config struct {
 	roundTimeout time.Duration
 	batch        int
 	concurrency  int
+	readyCache   bool
+	activity     time.Duration
 }
 
 func main() {
@@ -72,6 +74,8 @@ func run() error {
 	}
 	c := control.New(store, runtime, profiles, cfg.idle)
 	c.GracePeriod, c.StartupGrace = cfg.grace, cfg.startupGrace
+	c.DisableReadyCache = !cfg.readyCache
+	c.ActivityFlushInterval = cfg.activity
 	scheduler := control.NewScheduler(c)
 	scheduler.Interval, scheduler.RoundTimeout = cfg.interval, cfg.roundTimeout
 	scheduler.BatchSize, scheduler.Concurrency = cfg.batch, cfg.concurrency
@@ -109,6 +113,9 @@ func run() error {
 	case <-drainCtx.Done():
 		slog.Warn("scheduler did not drain before the deadline; unfinished reconciles are retried on the next start")
 	}
+	if flushErr := c.FlushActivity(); flushErr != nil {
+		slog.Error("flush request activity", "error", flushErr)
+	}
 	return err
 }
 
@@ -127,6 +134,8 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.DurationVar(&cfg.roundTimeout, "round-timeout", time.Minute, "upper bound for a single scheduler round")
 	fs.IntVar(&cfg.batch, "batch", 64, "workspaces loaded per scan batch")
 	fs.IntVar(&cfg.concurrency, "sweep-concurrency", 4, "workspaces reconciled concurrently")
+	fs.BoolVar(&cfg.readyCache, "ready-cache", true, "cache ready workspace endpoints")
+	fs.DurationVar(&cfg.activity, "activity-flush", control.DefaultActivityFlushInterval, "longest delay before request activity is persisted; 0 persists every request")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -162,6 +171,10 @@ func (c config) validate() error {
 		return errors.New("-batch must be in [1, 10000]")
 	case c.concurrency < 1 || c.concurrency > 64:
 		return errors.New("-sweep-concurrency must be in [1, 64]")
+	case c.activity < 0 || (c.activity > 0 && c.activity >= c.idle):
+		// Activity lost in a crash must stay well inside the restart grace,
+		// which is one idle timeout long.
+		return errors.New("-activity-flush must be in [0, -idle)")
 	}
 	return nil
 }
