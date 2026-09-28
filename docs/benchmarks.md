@@ -36,9 +36,20 @@ did. The next identified bottleneck is the per-request state snapshot:
 `Acquire` and `release` both persist activity to the local JSON snapshot,
 which performs a synchronous file write and `fsync`.
 
-A production-like follow-up should move activity counters out of the hot path,
-batch or asynchronously flush snapshots, and run the load generator on a
-separate machine or node.
+The follow-up moved activity counters out of the request fsync path and added a
+pooled upstream transport. A later local branch also added an informer-backed
+Kubernetes read cache and event-driven reconciliation. In a two-node kind run
+with the ready-address cache disabled to expose the runtime read path, baseline
+performed Deployment GETs during steady state while the informer variant
+performed none; the remaining discovery GET came from the controller readiness
+probe. The forced-observation throughput comparison is intentionally not
+published as a product number because disabling the ready cache is a
+deliberately degraded configuration.
+
+The same run added cold-start histograms for schedule, pull, ready, and total.
+Kubernetes condition timestamps are commonly second-granular, so phase sums can
+be coarse even though the total uses the controller's real clock. Raw local
+artifacts are intentionally excluded from the repository.
 
 ## Idempotency
 

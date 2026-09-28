@@ -12,9 +12,11 @@ It manages one Deployment, Service, and PersistentVolumeClaim per workspace. Wor
 - Three-stage reclamation: idle stop, suspension, and hard delete after a grace period.
 - Idempotent lifecycle operations using caller-provided business IDs.
 - Durable intent and reconciliation across controller restarts.
+- Event-driven reconciliation with a rate-limited retry queue.
+- Kubernetes informer cache for managed workloads, with direct API fallback.
 - Bounded reconciliation concurrency and per-workspace serialization.
 - Readiness-aware HTTP and SSE/WebSocket forwarding.
-- Audit trail and Prometheus-compatible metrics.
+- Audit trail, cold-start histograms, and Prometheus-compatible metrics.
 
 ## Architecture
 
@@ -30,12 +32,12 @@ Controller state machine
    |       +--> Service
    |       +--> PersistentVolumeClaim
    |
-   +--> local JSON snapshot
+   +--> bbolt state database
    +--> audit log
    +--> metrics
 ```
 
-The controller records intent before touching Kubernetes. Reconciliation is idempotent, serialized per workspace, and safe to retry after a restart.
+The controller records intent before touching Kubernetes. Reconciliation is idempotent, serialized per workspace, and safe to retry after a restart. Periodic reconciliation is the backstop; runtime events and API intent changes enter a deduplicating event queue for low-latency updates.
 
 ## Quick Start
 

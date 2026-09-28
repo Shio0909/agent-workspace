@@ -37,8 +37,8 @@ Status: processing -> success | failed   （两个终态都不可逆）
 
 ### 存储与保留
 
-- 记录落在数据目录的 `operations.json`，与工作区快照同一套"临时文件 + rename"原子写。
-- 检查与插入在 `Store` 的同一把锁内完成，这是 biz_id 上的事务边界；单进程由数据目录上的建议锁保证（第二个控制器进程会被直接拒绝）。
+- 工作区与幂等记录落在数据目录的 `state.db`：bbolt 的 `workspaces` 和 `operations` bucket，每次只写发生变化的记录；并发的不同记录共享一个事务和一次 fsync。
+- 检查与插入由 `Store` 在同一事务边界内完成；单进程由数据目录上的建议锁保证（第二个控制器进程会被直接拒绝）。旧版 JSON 快照首次打开时导入，并保留为 `*.migrated`。
 - 记录数量上限 `MaxOperations`（默认 10000），超出后按完成时间淘汰最旧的**终态**记录。`processing` 记录永不淘汰：淘汰一条正在执行的记录等于允许它被再执行一次；如果所有记录都在执行中，宁可超限也不误伤。
 
 ### 保证与不保证
@@ -123,7 +123,7 @@ suspended --宽限期满--> deleted        （硬删 Deployment/Service/PVC）
 1. **suspended 阶段必须保留 PVC**。这一跳调用的是 `Runtime.Stop`（接口约定：Stop 必须保留存储），`Runtime.Delete` 在这条路径上完全不可达。
 2. **只有 `Desired=deleted` 才会调用 `Runtime.Delete`**。触发者只有两个：用户显式删除，或宽限期满。
 3. **回收只在工作区空闲时推进**（无在途请求、无有效租约）。租期到期不足以掐断一个正在运行的任务；推迟不会丢状态，因为截止时间仍然在过去。
-4. **先落盘意图，再做运行时动作**。回收决策写入快照之后才会调用运行时，所以在这里崩溃不会留下"看起来还在运行、实际资源已删"的状态。
+4. **先落盘意图，再做运行时动作**。回收决策写入持久化 Store 之后才会调用运行时，所以在这里崩溃不会留下"看起来还在运行、实际资源已删"的状态。
 5. **墓碑不会被再次回收**：`Phase=deleted` 的工作区直接跳过。
 
 ### 保证与不保证
@@ -146,16 +146,18 @@ suspended --宽限期满--> deleted        （硬删 Deployment/Service/PVC）
 
 `Scheduler` 是控制面唯一的周期性驱动。一轮扫描经由 `Reconcile` 同时完成四件事：对账运行时、空闲缩容、过期挂起、宽限期满硬删。
 
+周期扫描是兜底。`runtime` 提供事件源时，Deployment/Pod watch 事件会进入去重、指数退避的 event queue；`start`/`stop`/`restart`/`delete` 写入 intent 后也会立即入队。事件路径不承担时间驱动语义，事件丢失时仍由 scheduler 收敛。
+
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `-reconcile` | 5s | 轮询周期。 |
 | `-round-timeout` | 1m | 单轮执行上限：到点后不再派发新的工作区，等在途对账收尾。 |
-| `-batch` | 64 | 每批从快照里取多少条工作区。 |
+| `-batch` | 64 | 每批从内存状态索引里取多少条工作区。 |
 | `-sweep-concurrency` | 4 | 同时执行多少条对账（与旧版固定 4 路并发一致）。 |
 | `-startup-grace` | 1m | 进程启动后的回收静默期。 |
 | `-grace` | 24h | 挂起后的宽限期。 |
 
-- **批量扫描**：`Store.Scan(after, limit)` 用 ID 作为游标分页推进，一轮里同时展开的工作区数量由页大小决定，而不是由快照总量决定。（注意：`Store` 本身是内存快照，分页限制的是工作集与并发，不是磁盘 IO。有序索引只在 ID 集合变化时重建，否则频繁对账会让每页都重排一次全量。）
+- **批量扫描**：`Store.Scan(after, limit)` 用 ID 作为游标分页推进，一轮里同时展开的工作区数量由页大小决定，而不是由工作区总量决定。（注意：`Store` 启动时加载一份内存索引，分页限制的是工作集与并发，不是磁盘 IO。有序索引只在 ID 集合变化时重建，否则频繁对账会让每页都重排一次全量。）
 - **失败不中断整轮**：单条失败只计数、记日志、继续处理其余工作区。
 - **启动静默期**：`StartupGrace` 内不做挂起与硬删。重启时工作区可能正在恢复，或者调用方正准备续期，第一轮扫描不应该把它们当垃圾。空闲缩容另有一个基于 `-idle` 的重启宽限期，两者独立。
 - 一轮结束后按统计打日志：正常走 Debug，有失败或超时走 Warn。
@@ -170,7 +172,7 @@ suspended --宽限期满--> deleted        （硬删 Deployment/Service/PVC）
 
 ## 5. 可观测性
 
-`GET /metrics` 输出 Prometheus 文本格式，**需要控制令牌**（它会暴露工作区数量）。手写而不是引入客户端库：只有单调计数和抓取时快照的 gauge，标准库足够。
+`GET /metrics` 输出 Prometheus 文本格式，**需要控制令牌**（它会暴露工作区数量）。手写而不是引入客户端库：当前只需要 counter、gauge 和固定桶 histogram，标准库足够。
 
 | 指标 | 类型 | 含义 |
 | --- | --- | --- |
@@ -184,6 +186,10 @@ suspended --宽限期满--> deleted        （硬删 Deployment/Service/PVC）
 | `nc_hard_deletes_total` | counter | Deployment/Service/PVC 被删除的次数。 |
 | `nc_operations_started_total` / `nc_operation_replays_total` / `nc_operation_takeovers_total` | counter | 首次提交 / 重放 / 接管陈旧记录。 |
 | `nc_audit_failures_total` | counter | 写审计失败的次数。 |
+| `nc_event_reconciles_total` / `nc_event_reconcile_failures_total` | counter | 事件驱动对账次数，以及失败并重新入队的次数。 |
+| `nc_workspace_acquire_seconds` | histogram | 请求等待可用 endpoint 的耗时。 |
+| `nc_workspace_start_seconds{phase}` | histogram | 冷启动的 schedule、pull、ready、total 分阶段耗时。 |
+| `nc_kube_api_requests_total{verb,resource}` | counter | 控制器发送到 Kubernetes API 的请求，用来验证 informer cache 的效果。 |
 
 计数器是进程内的，**重启归零**；gauge 每次抓取从快照重算，所以不会漂移。标签按值排序输出，两次抓取可以直接比对。
 
@@ -235,12 +241,14 @@ suspended --宽限期满--> deleted        （硬删 Deployment/Service/PVC）
 - 回收：挂起保留存储（`Runtime.Delete` 调用次数为 0）、宽限期满才硬删、宽限期跨重启延续、启动静默期阻止回收、租约阻止到期挂起、显式删除跳过宽限期、过期工作区拒绝唤醒与续期恢复。
 - 调度：分页不重不漏、批大小与并发上限（含并发确实发生）、单轮超时、单条失败不中断、跳过墓碑、`Run` 能被取消。
 - 工程项：指标文本格式与取值、就绪与存活分离、`/metrics` 鉴权、审计与续期端点、启动配置校验。
+- 事件与缓存：event queue 去重、退避、shutdown 唤醒、intent/runtime event 触发、Acquire 事件唤醒；informer cache 的 sync、cache-only read、cache miss、fallback 和冷启动时间戳。
+- 故障注入：随机 crash/restart、运行时故障、丢失响应，以及 6 个故意植入的 mutant。
 
 盲区（没有测到，也不假装测到）：
 
 - **kube 层使用 `client-go/fake` 做 typed object 单元测试，并提供 kind e2e smoke test**；生产集群的长期稳定性仍不在单元测试范围内。
 - **时间相关行为使用注入的假时钟**。真实时钟下的长周期（24h 宽限期）没有端到端验证，也没有跨越真实时间的时钟漂移测试。
-- **没有做崩溃点故障注入**。不会在"快照已写、运行时未调用"之间真的杀进程；这类路径靠重启后的重放测试间接覆盖。
+- **chaos test 是进程内关闭并重开 Controller/Store，不是真正 kill 进程**；它覆盖状态恢复，但不覆盖 OS 进程退出、文件系统断电或 kubelet 行为。
 - **fsync 只验证了被调用**，没有断电级别的持久化验证（单元测试无法模拟掉电）。
 - **没有多进程并发测试**。数据目录的 flock 只验证了"第二个进程被拒绝"，没有验证两个进程同时写会怎样（设计上不允许）。
 - **Prometheus 文本没有用 promtool 校验**，只做了自解析与格式断言。
@@ -256,7 +264,7 @@ suspended --宽限期满--> deleted        （硬删 Deployment/Service/PVC）
 | 控制器在动作中途崩溃 | 意图已落盘的动作会在下次启动被重做；幂等记录超过存活上限后可被接管 | 不会重复执行；放弃中的动作可能已经产生副作用 |
 | 后端 API 不可达 | 对账失败被计数并保留错误，下一轮重试；`/ready` 返回 503 | 回收会按时发生（重试期间会推迟） |
 | 写审计失败 | 动作照常完成，失败被计数并记录日志 | 审计完整（会丢这条记录） |
-| 快照文件损坏 | 启动直接失败，不会静默重置数据 | 自动恢复 |
+| 状态数据库损坏 | 启动直接失败，不会静默重置数据 | 自动恢复 |
 | 审计文件末尾有半行 | 打开时补换行，损坏被限制在一条记录内；坏行被查询跳过 | 半行那条记录可读 |
 | 删除存储前进程被杀 | 意图（`Desired=deleted`）仍在，重启后重删 | 删除已完成 |
 | 停机超时 | 未完成的对账在下次启动重做 | 在途请求一定完成 |
