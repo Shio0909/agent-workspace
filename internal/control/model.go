@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"time"
 )
@@ -167,6 +168,37 @@ type Observation struct {
 	Exists   bool
 	Ready    bool
 	Endpoint string
+}
+
+// StartupTimestamps 是最新 pod 的就绪时间线，用来拆冷启动耗时。零值表示那个
+// 阶段还没发生（或者缓存还没看到）。
+type StartupTimestamps struct {
+	Scheduled        time.Time
+	ContainerStarted time.Time
+	Ready            time.Time
+	PodName          string
+}
+
+// Complete reports whether every cold-start phase timestamp is present.
+func (ts StartupTimestamps) Complete() bool {
+	return !ts.Scheduled.IsZero() && !ts.ContainerStarted.IsZero() && !ts.Ready.IsZero()
+}
+
+// EventSource 是 Runtime 的可选能力：工作区的运行时状态变化时投递它的 ID。
+// 事件只是提示，可以丢；周期调度是兜底。
+type EventSource interface {
+	WorkspaceEvents() <-chan string
+}
+
+// StartupObserver 是 Runtime 的可选能力，只服务于冷启动指标。
+type StartupObserver interface {
+	StartupTimestamps(context.Context, Workspace, bool) (StartupTimestamps, bool)
+}
+
+// MetricsExporter 是 Runtime 的可选能力，把自己对后端的调用统计追加到
+// /metrics 输出里。
+type MetricsExporter interface {
+	WriteMetrics(io.Writer) error
 }
 
 // Runtime owns compute and workspace storage. Stop must preserve storage;

@@ -23,8 +23,8 @@ type actionRecord struct{ verb, resource, subresource string }
 
 func testObjects(w control.Workspace, replicas int32) (*appsv1.Deployment, *corev1.Service, *corev1.PersistentVolumeClaim) {
 	return ownedDeployment(w, replicas, 0),
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: labels(w)}},
-		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: labels(w)}}
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: workspaceLabels(w)}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name(w), Namespace: "agent-workspace", Labels: workspaceLabels(w)}}
 }
 
 func TestQuantStopAndRestartNeverDeletePVC(t *testing.T) {

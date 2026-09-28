@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"agent-workspace/internal/control"
@@ -22,6 +23,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	appslisters "k8s.io/client-go/listers/apps/v1"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/utils/ptr"
@@ -42,6 +45,14 @@ type Runtime struct {
 	Client        kubernetes.Interface
 	HTTPClient    *http.Client
 	ProbeFunc     func(context.Context) error
+	// APIRequests counts every call to the API server. It is wired into the
+	// rest.Config transport by NewRuntime; tests on the fake client bypass it.
+	APIRequests *APIMetrics
+
+	events      chan string
+	deployments appslisters.DeploymentLister
+	pods        corelisters.PodLister
+	synced      atomic.Bool
 }
 
 // NewRuntime builds a Kubernetes client from in-cluster credentials or the
@@ -51,11 +62,13 @@ func NewRuntime(namespace, kubeContext string) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	metrics := NewAPIMetrics()
+	cfg.WrapTransport = metrics.Wrap
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create kubernetes client: %w", err)
 	}
-	return &Runtime{Namespace: namespace, Client: client}, nil
+	return &Runtime{Namespace: namespace, Client: client, APIRequests: metrics}, nil
 }
 
 func loadRESTConfig(kubeContext string) (*rest.Config, error) {
@@ -80,7 +93,7 @@ func (r *Runtime) client() (kubernetes.Interface, error) {
 
 func name(w control.Workspace) string { return "nc-" + w.ID }
 
-func labels(w control.Workspace) map[string]string {
+func workspaceLabels(w control.Workspace) map[string]string {
 	return map[string]string{managedByLabel: managedByValue, workspaceLabel: w.ID}
 }
 
@@ -89,11 +102,7 @@ func owns(itemLabels map[string]string, w control.Workspace) bool {
 }
 
 func (r *Runtime) Observe(ctx context.Context, w control.Workspace, p control.Profile) (control.Observation, error) {
-	client, err := r.client()
-	if err != nil {
-		return control.Observation{}, err
-	}
-	d, err := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{})
+	d, err := r.getDeployment(ctx, name(w))
 	if apierrors.IsNotFound(err) {
 		return control.Observation{}, nil
 	}
@@ -173,17 +182,27 @@ func (r *Runtime) ensureDeployment(ctx context.Context, desired *appsv1.Deployme
 	if err != nil {
 		return err
 	}
-	current, err := client.AppsV1().Deployments(r.Namespace).Get(ctx, desired.Name, metav1.GetOptions{})
+	current, err := r.getDeployment(ctx, desired.Name)
 	if apierrors.IsNotFound(err) {
-		_, err = client.AppsV1().Deployments(r.Namespace).Create(ctx, desired, metav1.CreateOptions{})
-		return err
-	}
-	if err != nil {
+		if _, err = client.AppsV1().Deployments(r.Namespace).Create(ctx, desired, metav1.CreateOptions{}); err == nil {
+			return nil
+		}
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		// The cache lags behind the API server: the create raced with a read
+		// that did not see the object yet. Read it directly and continue.
+		if current, err = client.AppsV1().Deployments(r.Namespace).Get(ctx, desired.Name, metav1.GetOptions{}); err != nil {
+			return err
+		}
+	} else if err != nil {
 		return err
 	}
 	if !owns(current.Labels, w) {
 		return fmt.Errorf("refusing unmanaged deployment %s", desired.Name)
 	}
+	// A lister returns the shared cache object; never mutate it in place.
+	current = current.DeepCopy()
 	hash := desired.Annotations[specHashAnnotation]
 	if current.Annotations[specHashAnnotation] == hash {
 		// The template is already what we want. Ensure runs on every poll while a
@@ -263,13 +282,14 @@ func (r *Runtime) Restart(ctx context.Context, w control.Workspace) error {
 	if err != nil {
 		return err
 	}
-	d, err := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{})
+	d, err := r.getDeployment(ctx, name(w))
 	if err != nil {
 		return err
 	}
 	if !owns(d.Labels, w) {
 		return fmt.Errorf("refusing unmanaged deployment %s", name(w))
 	}
+	d = d.DeepCopy()
 	if d.Spec.Template.Annotations == nil {
 		d.Spec.Template.Annotations = map[string]string{}
 	}
@@ -283,7 +303,7 @@ func (r *Runtime) Stop(ctx context.Context, w control.Workspace) error {
 	if err != nil {
 		return err
 	}
-	d, err := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{})
+	d, err := r.getDeployment(ctx, name(w))
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
@@ -294,6 +314,7 @@ func (r *Runtime) Stop(ctx context.Context, w control.Workspace) error {
 		return fmt.Errorf("refusing unmanaged deployment %s", name(w))
 	}
 	if d.Spec.Replicas == nil || *d.Spec.Replicas != 0 {
+		d = d.DeepCopy()
 		d.Spec.Replicas = ptr.To(int32(0))
 		if _, err := client.AppsV1().Deployments(r.Namespace).Update(ctx, d, metav1.UpdateOptions{}); err != nil {
 			return err
@@ -302,7 +323,9 @@ func (r *Runtime) Stop(ctx context.Context, w control.Workspace) error {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		current, err := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{})
+		// With the cache synced this poll is memory-only; without it the poll
+		// still goes to the API server, exactly as before.
+		current, err := r.getDeployment(ctx, name(w))
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
@@ -365,7 +388,7 @@ func (r *Runtime) checkOwnership(ctx context.Context, w control.Workspace) error
 	if err != nil {
 		return err
 	}
-	if d, err := client.AppsV1().Deployments(r.Namespace).Get(ctx, name(w), metav1.GetOptions{}); err == nil {
+	if d, err := r.getDeployment(ctx, name(w)); err == nil {
 		if !owns(d.Labels, w) {
 			return fmt.Errorf("refusing unmanaged deployment %s", name(w))
 		}
@@ -398,7 +421,7 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 		return nil, nil, nil, err
 	}
 	q := quantities(p)
-	meta := metav1.ObjectMeta{Name: name(w), Namespace: namespace, Labels: labels(w)}
+	meta := metav1.ObjectMeta{Name: name(w), Namespace: namespace, Labels: workspaceLabels(w)}
 	storage := q.storage
 	pvc := &corev1.PersistentVolumeClaim{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeClaim"},
@@ -473,9 +496,9 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To(int32(1)),
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
-			Selector: &metav1.LabelSelector{MatchLabels: labels(w)},
+			Selector: &metav1.LabelSelector{MatchLabels: workspaceLabels(w)},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels(w)},
+				ObjectMeta: metav1.ObjectMeta{Labels: workspaceLabels(w)},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext:              &corev1.PodSecurityContext{FSGroup: ptr.To(int64(1000))},
@@ -494,7 +517,7 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
 		ObjectMeta: meta,
 		Spec: corev1.ServiceSpec{
-			Selector: labels(w),
+			Selector: workspaceLabels(w),
 			Ports:    []corev1.ServicePort{{Name: "http", Port: int32(p.Port), TargetPort: intstr.FromString("http")}},
 		},
 	}

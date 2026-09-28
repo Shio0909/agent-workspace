@@ -14,7 +14,7 @@ func TestParseConfigAppliesOverrides(t *testing.T) {
 	cfg, err := parseConfig([]string{
 		"-listen", "0.0.0.0:9000", "-data", "/data", "-namespace", "workspaces",
 		"-grace", "48h", "-startup-grace", "30s", "-reconcile", "2s",
-		"-round-timeout", "20s", "-batch", "8", "-sweep-concurrency", "2", "-ready-cache=false",
+		"-round-timeout", "20s", "-batch", "8", "-sweep-concurrency", "2", "-ready-cache=false", "-kube-cache=false",
 	}, tokenFunc)
 	if err != nil {
 		t.Fatal(err)
@@ -23,7 +23,7 @@ func TestParseConfigAppliesOverrides(t *testing.T) {
 		t.Fatalf("options were not applied: %+v", cfg)
 	}
 	if cfg.grace != 48*time.Hour || cfg.startupGrace != 30*time.Second || cfg.interval != 2*time.Second ||
-		cfg.roundTimeout != 20*time.Second || cfg.batch != 8 || cfg.concurrency != 2 || cfg.readyCache {
+		cfg.roundTimeout != 20*time.Second || cfg.batch != 8 || cfg.concurrency != 2 || cfg.readyCache || cfg.kubeCache {
 		t.Fatalf("durations or bounds were not applied: %+v", cfg)
 	}
 	if cfg.token == "" {
