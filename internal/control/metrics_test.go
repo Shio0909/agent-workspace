@@ -181,7 +181,7 @@ func TestMetricsTextIsWellFormedAndStable(t *testing.T) {
 		case strings.HasPrefix(line, "# TYPE "):
 			fields := strings.Fields(line)
 			types[fields[2]]++
-			if fields[3] != "counter" && fields[3] != "gauge" {
+			if fields[3] != "counter" && fields[3] != "gauge" && fields[3] != "histogram" {
 				t.Fatalf("unexpected metric type in %q", line)
 			}
 		}
@@ -189,7 +189,8 @@ func TestMetricsTextIsWellFormedAndStable(t *testing.T) {
 	for _, name := range []string{"nc_workspaces", "nc_operations", "nc_leases", "nc_reconcile_total",
 		"nc_reconcile_failures_total", "nc_idle_stops_total", "nc_expirations_total", "nc_suspensions_total",
 		"nc_hard_deletes_total", "nc_operations_started_total", "nc_operation_replays_total",
-		"nc_operation_takeovers_total", "nc_audit_failures_total"} {
+		"nc_operation_takeovers_total", "nc_audit_failures_total", "nc_event_reconciles_total",
+		"nc_event_reconcile_failures_total", "nc_workspace_acquire_seconds", "nc_workspace_start_seconds"} {
 		if help[name] != 1 || types[name] != 1 {
 			t.Fatalf("%s is missing HELP/TYPE: help=%d type=%d", name, help[name], types[name])
 		}
