@@ -20,6 +20,9 @@ type slot struct {
 	// path never waits for an fsync. It is merged into the persisted
 	// LastActivity at most once per ActivityFlushInterval, and on shutdown.
 	activity time.Time
+	// wake 是容量为 1 的通知槽：事件驱动对账完成后唤醒正在等待这个工作区
+	// 就绪的请求，而不是让它们睡满一个 PollInterval。
+	wake chan struct{}
 }
 
 const runtimeReadyTTL = 5 * time.Second
@@ -61,6 +64,7 @@ type Controller struct {
 
 	now      func() time.Time
 	started  time.Time
+	queue    *eventQueue
 	readyMu  sync.Mutex
 	readyErr error
 	readyAt  time.Time
@@ -72,12 +76,24 @@ func New(store *Store, runtime Runtime, profiles map[string]Profile, idle time.D
 		GracePeriod: 24 * time.Hour, StartupGrace: time.Minute, OperationLease: 10 * time.Minute,
 		ProbeTimeout: 3 * time.Second, ReadyTTL: 2 * time.Second,
 		ActivityFlushInterval: DefaultActivityFlushInterval,
-		Metrics:               &Metrics{}, now: time.Now, started: time.Now()}
+		Metrics:               &Metrics{}, now: time.Now, started: time.Now(), queue: newEventQueue()}
 }
 
 func (c *Controller) slot(id string) *slot {
-	s, _ := c.slots.LoadOrStore(id, &slot{})
+	s, _ := c.slots.LoadOrStore(id, &slot{wake: make(chan struct{}, 1)})
 	return s.(*slot)
+}
+
+// wake 非阻塞地通知 Acquire 再试一次。事件 worker 不能等待一个正在执行慢
+// Stop 的工作区锁；陈旧通知最多多触发一次幂等 Reconcile。
+func (c *Controller) wake(id string) {
+	if v, ok := c.slots.Load(id); ok {
+		s := v.(*slot)
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // withActivity overlays unflushed request activity so readers never see an
@@ -235,6 +251,7 @@ func (c *Controller) SetDesired(actor, id, desired string) (Workspace, error) {
 		return w, err
 	}
 	s.endpoint, s.readyUntil = "", time.Time{}
+	c.queue.Add(id)
 	c.audit(actor, desiredAction(desired), id, "desired="+desired, ResultOK)
 	return w, nil
 }
@@ -266,6 +283,7 @@ func (c *Controller) Restart(actor, id string) (Workspace, error) {
 		return w, err
 	}
 	s.endpoint, s.readyUntil = "", time.Time{}
+	c.queue.Add(id)
 	c.audit(actor, ActionRestart, id, "workload replaced, volume retained", ResultOK)
 	return w, nil
 }
@@ -392,6 +410,7 @@ func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), er
 	if err == nil && (w.Desired == DesiredSuspended || w.expired(c.now())) {
 		err = ErrExpired
 	}
+	woke := false
 	if err == nil {
 		now := c.now()
 		if w.Desired != DesiredRunning {
@@ -399,6 +418,7 @@ func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), er
 			s.activity = now
 			w.Desired, w.LastActivity, w.UpdatedAt = DesiredRunning, now, now
 			err = c.store.Put(w)
+			woke = err == nil
 		} else {
 			err = c.touch(s, &w, now)
 		}
@@ -408,7 +428,11 @@ func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), er
 		return "", nil, err
 	}
 	s.active++
+	drainWake(s.wake)
 	s.mu.Unlock()
+	if woke {
+		c.queue.Add(id)
+	}
 	var once sync.Once
 	release := func() {
 		once.Do(func() {
@@ -440,6 +464,18 @@ func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), er
 			release()
 			return "", nil, ctx.Err()
 		case <-ticker.C:
+		case <-s.wake:
+			// 事件驱动的对账已经完成了一轮：立刻重试，而不是睡满 PollInterval。
+		}
+	}
+}
+
+func drainWake(ch <-chan struct{}) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
 		}
 	}
 }
