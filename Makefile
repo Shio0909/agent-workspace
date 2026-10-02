@@ -1,10 +1,13 @@
-.PHONY: test build vet images agent-images e2e e2e-continuity e2e-eino-agent e2e-eino-agent-faults e2e-isolation
+.PHONY: test build vet vuln images agent-images e2e e2e-continuity e2e-eino-agent e2e-eino-agent-faults e2e-isolation
 KIND_CLUSTER ?= agent-workspace
 
 test:
 	go test -race ./...
 vet:
 	go vet ./...
+# Known vulnerabilities in dependencies and the standard library that the code can reach.
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 build:
 	mkdir -p bin
 	go build -o bin/agent-workspace ./cmd/agent-workspace
