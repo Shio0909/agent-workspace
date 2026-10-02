@@ -16,10 +16,18 @@ spec:
         app: fake-llm
     spec:
       automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: fake-llm
           image: agent-workspace-fakellm:local
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: FAKE_LLM_KEYS
               value: key-v1

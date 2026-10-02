@@ -40,7 +40,7 @@ The pod runs as uid 1000 with every capability dropped, so the entrypoint does n
 
 ## Security notes that are specific to this profile
 
-- eino_agent runs with `auth.enabled: false`. The gateway authenticates callers with the control token, but port 8080 of the pod is reachable by anything that can route to the pod. This repository has no NetworkPolicy ([SECURITY.md](../SECURITY.md)), so on a shared cluster that is a real gap, not a footnote.
+- eino_agent runs with `auth.enabled: false`. The gateway authenticates callers with the control token, but port 8080 of the pod is reachable by anything that can route to the pod. `deploy/controller.yaml` therefore carries a NetworkPolicy that admits only the controller to workspace pods, and `scripts/kind-isolation.sh` checks that an unrelated pod and a second workspace are blocked while the gateway still works. That holds only on a CNI that enforces NetworkPolicy ([SECURITY.md](../SECURITY.md)); egress is not restricted.
 - The key is passed to the server as an environment variable after the entrypoint reads it from the file. It is visible to anything that can read `/proc/<pid>/environ` inside the container.
 - The server reads the key once. The profile therefore sets `restart_on_credential_change`, and a rotation replaces the pod (the e2e below checks this).
 
@@ -93,7 +93,7 @@ What this does not cover, and the limits of what it does:
 - **The provider's invoice.** Usage numbers are what the provider reported to eino_agent. No provider-side query was available to compare.
 - **Load.** Six concurrent turns, one workspace. Not sustained load, not many workspaces, and not large document ingestion.
 - **Crash consistency beyond what PostgreSQL promises.** `kill -9` of PostgreSQL and a force-deleted pod are process and pod deaths. A node losing power, or a storage class that acknowledges writes it has not made durable, was not tested.
-- **The kind defaults.** One node, the default storage class, no NetworkPolicy enforcement checked, auth off inside the pod.
+- **The kind defaults.** One node, the default storage class, auth off inside the pod. The isolation check used kind's own CNI; another CNI was not tried.
 - **Timing is host-measured.** In one local image test the container's log timestamps disagreed with the elapsed time measured on the host by about 45 seconds (the VM's clock, not the service), so durations here come from the host, not from log timestamps.
 
 ## Build and run

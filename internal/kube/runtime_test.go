@@ -301,3 +301,36 @@ func TestValidateProfileRejectsMalformedQuantities(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A workspace pod has to satisfy the Pod Security "restricted" profile, so that
+// a namespace can enforce it. The non-root requirement is checked by the
+// kubelet against the image's numeric USER, which every profile image sets.
+func TestWorkspacePodMeetsThePodSecurityRestrictedProfile(t *testing.T) {
+	_, d, _, err := BuildObjects(control.Workspace{ID: "a1"}, profile(), "agent-workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := d.Spec.Template.Spec
+	psc := spec.SecurityContext
+	if psc == nil || psc.RunAsNonRoot == nil || !*psc.RunAsNonRoot {
+		t.Fatalf("pod must set runAsNonRoot: %+v", psc)
+	}
+	if psc.SeccompProfile == nil || psc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Fatalf("pod must use the RuntimeDefault seccomp profile: %+v", psc.SeccompProfile)
+	}
+	if psc.FSGroup == nil || *psc.FSGroup != 1000 {
+		t.Fatalf("fsGroup changed: %+v", psc.FSGroup)
+	}
+	for _, c := range spec.Containers {
+		sc := c.SecurityContext
+		if sc == nil || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+			t.Fatalf("container %s must forbid privilege escalation", c.Name)
+		}
+		if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" {
+			t.Fatalf("container %s must drop ALL capabilities: %+v", c.Name, sc.Capabilities)
+		}
+		if sc.Privileged != nil && *sc.Privileged {
+			t.Fatalf("container %s is privileged", c.Name)
+		}
+	}
+}
