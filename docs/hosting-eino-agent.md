@@ -29,10 +29,10 @@ The profile model is one container and one PVC. The options I weighed:
 What the choice costs, so nobody has to find out later:
 
 - **No HA, no backup beyond the PVC.** Losing the PVC loses the sessions. This is the same promise the `agent` profile makes.
-- **The entrypoint is a shell script, not an init system.** It starts PostgreSQL, runs the migrations, starts the server, and on SIGTERM stops the server first (so its final usage flush still has a database) and then PostgreSQL. If PostgreSQL dies while the server lives, the server stays up and `/health/ready` starts failing. Whether the controller then replaces the pod depends on its readiness handling; I did not test killing PostgreSQL.
+- **The entrypoint is a shell script, not an init system.** It starts PostgreSQL, runs the migrations, starts the server, and on SIGTERM stops the server first (so its final usage flush still has a database) and then PostgreSQL. `pg_ctl` daemonizes PostgreSQL, so the shell has no child to wait on; a small watcher checks the postmaster every two seconds (a zombie counts as dead) and, when it is gone, stops the server and exits non-zero. The container then restarts and PostgreSQL replays its WAL. Before the watcher existed the server stayed up with every query failing and recovery depended on the controller noticing the lost heartbeat, which took a minute and a pod replacement. A crashed backend that the postmaster survives is not treated as a death: PostgreSQL restarts its own backends.
 - **A PostgreSQL major version is part of the image.** The data directory is version 17. Moving to 18 means a dump and restore, not an image bump.
-- **One memory budget.** PostgreSQL (`shared_buffers` 64MB by default here) and the server share the profile's 1Gi. I did not load-test it.
-- **Redis is optional but not quiet.** eino_agent has no switch to turn Redis off, only a default of `localhost:6379`. Without one it logs a dial failure and degrades to no cache, which adds about two seconds to each process start.
+- **One memory budget.** PostgreSQL (`shared_buffers` 64MB by default here) and the server share the profile's 1Gi. Six concurrent chat turns peaked at about 78MB in the cgroup's `memory.peak` (which includes page cache) with no OOM kill, so the limit has a wide margin for this workload. Document ingestion of large files was not measured.
+- **Redis is off.** The image has none, and eino_agent used to dial `localhost:6379` whenever `redis.addr` was empty, which cost a connection timeout on every start. `redis.disabled: true` in `config.workspace.yaml` skips the attempt.
 
 ## The process runs with no capabilities
 
@@ -46,7 +46,7 @@ The pod runs as uid 1000 with every capability dropped, so the entrypoint does n
 
 ## Usage accounting
 
-The meter wraps the chat model and counts what the provider reports on the response, for both `Generate` and `Stream`. It flushes additively every 5 seconds and once more on shutdown, so a graceful stop loses nothing. A hard kill loses at most the last few seconds of tokens, and the controller keeps the larger value it already recorded. A call that returns no usage (some providers omit it on a stream) is not counted; a live test confirmed that the provider used here reports usage on both call styles.
+The meter wraps the chat model and counts what the provider reports on the response, for both `Generate` and `Stream`. It flushes additively when a request ends, every 5 seconds, and once more on shutdown, so a graceful stop loses nothing. A hard kill (SIGKILL of the pod, or PostgreSQL dying) can only lose the tokens of a turn that was still running: the fault run below killed PostgreSQL and then the whole pod right after a turn and found everything committed. Before the flush-on-request-end change the same test lost one whole turn, 13,423 tokens, because the kill came inside the 5-second window; the controller kept the larger value it had recorded and audited `usage-regressed`, as designed. A call that returns no usage (some providers omit it on a stream) is not counted; a live test confirmed that the provider used here reports usage on both call styles.
 
 The number is what the provider said it billed for calls made by this process. It does not include a call that was cut off before the provider returned its usage.
 
@@ -73,7 +73,28 @@ Two things in that table need a caveat:
 
 Before the kind run, the same image ran under plain Docker with uid 1000, `--cap-drop ALL`, `no-new-privileges`, a 1GiB memory limit and a volume: `docker stop` took one second and exited 0, and after `docker start` the session and the usage count (8637 tokens by then) were still there. The server also ran natively against a scratch database with a graceful restart in between, with the same outcome.
 
-Not run: a PostgreSQL crash, a `kill -9` of the pod during a write, a concurrent load, knowledge-base ingestion (documents, embeddings other than the default `hash`), more than one workspace on the same cluster, a storage class other than kind's default, and anything with auth turned on inside the pod.
+### Failure and load: `scripts/kind-eino-agent-faults.sh`
+
+Same cluster, same image, same real model, one run end to end (`make e2e-eino-agent-faults`). Every step has an assertion; the numbers below are from the passing run.
+
+| Step | Result |
+| --- | --- |
+| Streamed answer through the gateway | First content event after 5.55s of 7.88s, 219 content events. Before the streaming fix eino_agent sent the whole answer in one event at the end |
+| PostgreSQL killed with SIGKILL, 6s after a turn | The watcher stopped the server, the container restarted in the same pod, and the workspace answered again 5s after the kill. The session was intact and the model repeated the token. Committed usage equalled the pod's count (0 unflushed), no `usage-regressed` |
+| PostgreSQL killed right after a turn | Answered again 17s after the kill. The kubelet's back-off for a second quick crash and the controller's heartbeat restart overlapped, so the pod was replaced. Session intact, 0 tokens unflushed, no `usage-regressed` |
+| Pod deleted with `--grace-period=0` (no clean PostgreSQL stop) | Replacement pod, session recovered, token repeated. What the pod had committed (54001) was still there (63266 after one more turn). The controller's count never went down |
+| Six concurrent turns | All six returned 200; `memory.peak` 77.7MB, `oom_kill` 0, no container restart |
+| Knowledge base: create, upload a document with a planted passphrase, ask | 1 chunk, default `hash` embedding. The agent found the passphrase (`supported_by_retrieval`, `evidence_count` 1) |
+| A second workspace in the same namespace | Own PVC. It could not see the first workspace's session or token. Usage counts 98331 and 8734, tracked separately |
+
+What this does not cover, and the limits of what it does:
+
+- **Embeddings other than `hash`.** The knowledge-base step used the default hash embedding, so it shows that ingestion and retrieval work end to end, not that semantic retrieval is good. A real embedding provider needs its own key and was not used.
+- **The provider's invoice.** Usage numbers are what the provider reported to eino_agent. No provider-side query was available to compare.
+- **Load.** Six concurrent turns, one workspace. Not sustained load, not many workspaces, and not large document ingestion.
+- **Crash consistency beyond what PostgreSQL promises.** `kill -9` of PostgreSQL and a force-deleted pod are process and pod deaths. A node losing power, or a storage class that acknowledges writes it has not made durable, was not tested.
+- **The kind defaults.** One node, the default storage class, no NetworkPolicy enforcement checked, auth off inside the pod.
+- **Timing is host-measured.** In one local image test the container's log timestamps disagreed with the elapsed time measured on the host by about 45 seconds (the VM's clock, not the service), so durations here come from the host, not from log timestamps.
 
 ## Build and run
 
@@ -81,9 +102,15 @@ Not run: a PostgreSQL crash, a `kill -9` of the pod during a write, a concurrent
 # in the eino_agent repository
 docker build -f docker/Dockerfile.workspace --build-arg AGENT_VERSION=v1 -t eino-agent-workspace:local .
 
+# in the eino_agent repository: no LLM or cluster needed, only Docker. Checks start, a
+# knowledge base surviving a PostgreSQL SIGKILL (the container must restart by itself),
+# and a clean stop.
+scripts/workspace-image-smoke.sh
+
 # in this repository: needs the image above and a real endpoint
 LLM_BASE_URL=https://example.com/v1 LLM_MODEL=some-model LLM_KEY_FILE=/path/to/keyfile \
-  make e2e-eino-agent KIND_CLUSTER=<a kind cluster>
+  make e2e-eino-agent KIND_CLUSTER=<a kind cluster>          # lifecycle
+  make e2e-eino-agent-faults KIND_CLUSTER=<a kind cluster>   # failure and load
 ```
 
 The profile's default `LLM_BASE_URL` points at the in-cluster fake LLM so that a workspace starts without a key. Real use overrides it.
