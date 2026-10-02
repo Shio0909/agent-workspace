@@ -1,4 +1,4 @@
-.PHONY: test build vet images agent-images e2e e2e-continuity
+.PHONY: test build vet images agent-images e2e e2e-continuity e2e-eino-agent
 KIND_CLUSTER ?= agent-workspace
 
 test:
@@ -26,3 +26,11 @@ e2e-continuity:
 	make agent-images
 	kind load docker-image agent-workspace:local agent-workspace-agent:local agent-workspace-agent:v2 agent-workspace-agent:bad agent-workspace-fakellm:local --name $(KIND_CLUSTER)
 	KIND_CLUSTER=$(KIND_CLUSTER) ./scripts/kind-continuity.sh
+# Needs eino-agent-workspace:local (docker build -f docker/Dockerfile.workspace in
+# the eino_agent repository) and LLM_BASE_URL, LLM_MODEL, LLM_KEY_FILE.
+e2e-eino-agent:
+	docker build --target controller -t agent-workspace:local .
+	printf 'FROM eino-agent-workspace:local\nENV AGENT_VERSION=v2\n' | docker build -t eino-agent-workspace:v2 -
+	printf 'FROM eino-agent-workspace:v2\nENTRYPOINT ["false"]\n' | docker build -t eino-agent-workspace:bad -
+	kind load docker-image agent-workspace:local eino-agent-workspace:local eino-agent-workspace:v2 eino-agent-workspace:bad --name $(KIND_CLUSTER)
+	KIND_CLUSTER=$(KIND_CLUSTER) ./scripts/kind-eino-agent.sh

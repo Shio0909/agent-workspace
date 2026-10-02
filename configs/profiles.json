@@ -27,5 +27,27 @@
       "agent-workspace-agent:*"
     ],
     "heartbeat_path": "/heartbeat"
+  },
+  "eino-agent": {
+    "image": "eino-agent-workspace:local",
+    "port": 8080,
+    "health_path": "/health/ready",
+    "mount_path": "/workspace",
+    "storage": "5Gi",
+    "cpu": "1",
+    "memory": "1Gi",
+    "credential_path": "/var/run/agent-credentials",
+    "restart_on_credential_change": true,
+    "env": {
+      "WORKSPACE_DIR": "/workspace",
+      "CREDENTIAL_DIR": "/var/run/agent-credentials",
+      "LLM_BASE_URL": "http://fake-llm.agent-workspace.svc.cluster.local:8081/v1",
+      "LLM_MODEL": "demo",
+      "LLM_CONTEXT_TOKENS": "32000"
+    },
+    "allowed_images": [
+      "eino-agent-workspace:*"
+    ],
+    "heartbeat_path": "/heartbeat"
   }
 }
