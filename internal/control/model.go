@@ -120,6 +120,11 @@ type Profile struct {
 	// 通过 API 注入凭据。它以文件而不是环境变量交付：文件会随 Secret 更新，
 	// 环境变量只能靠重启 Pod 才能换新。
 	CredentialPath string `json:"credential_path,omitempty"`
+	// RestartOnCredentialChange replaces the workload after a credential
+	// change, for software that reads its key once at start and cannot reload
+	// it. The new key is then live after one restart instead of never. A
+	// workspace that is not running is not touched: it starts with the new key.
+	RestartOnCredentialChange bool `json:"restart_on_credential_change,omitempty"`
 	// AllowedImages lists the images a workspace of this profile may be
 	// upgraded to: exact references, or a prefix ending in "*". Empty disables
 	// upgrades, because an API that accepts any image is an API that runs any
