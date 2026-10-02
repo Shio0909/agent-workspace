@@ -93,7 +93,7 @@ The controller exposes a small HTTP API.
 | `GET` | `/v1/audit` | Query lifecycle audit records |
 | `ANY` | `/w/{id}/*` | Forward HTTP, SSE, and WebSocket traffic |
 
-Lifecycle writes require `X-Biz-Id` for idempotency. All control-plane endpoints require `X-Control-Token`.
+Lifecycle writes require `X-Biz-Id` for idempotency. All control-plane endpoints require `X-Control-Token`. The shared token (`AGENT_WORKSPACE_TOKEN`) can do everything; with `-tokens` you can also issue tokens limited to some workspace ids or profiles, so callers cannot see or touch each other's workspaces (see [docs/control-plane.md](docs/control-plane.md), section 11).
 
 ## Agent workload
 
@@ -111,7 +111,7 @@ See [docs/control-plane.md](docs/control-plane.md) for the state machine and inv
 
 ## Security
 
-This project uses a single shared control token and targets a single-controller deployment. It is not a multi-tenant sandbox. See [SECURITY.md](SECURITY.md).
+This project uses a shared control token, optionally narrowed per caller with scoped tokens, and targets a single-controller deployment. It is not a multi-tenant sandbox. See [SECURITY.md](SECURITY.md).
 
 ## Benchmarks
 

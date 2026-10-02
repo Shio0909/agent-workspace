@@ -1,11 +1,15 @@
 package main
 
 import (
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"agent-workspace/internal/control"
+	"agent-workspace/internal/httpapi"
 )
 
 func tokenFunc(string) string { return strings.Repeat("k", 16) }
@@ -59,6 +63,44 @@ func TestParseConfigRejectsInvalidOptions(t *testing.T) {
 		if _, err := parseConfig(tc.args, tc.env); err == nil {
 			t.Fatalf("%s was accepted", name)
 		}
+	}
+}
+
+func TestScopedTokensAreOptionalAndCheckedAgainstTheSharedToken(t *testing.T) {
+	cfg, err := parseConfig([]string{"-tokens", "/etc/tokens.json"}, tokenFunc)
+	if err != nil || cfg.tokens != "/etc/tokens.json" {
+		t.Fatalf("-tokens was not applied: %+v %v", cfg, err)
+	}
+	if cfg, err := parseConfig(nil, tokenFunc); err != nil || cfg.tokens != "" {
+		t.Fatalf("scoped tokens must be off by default: %+v %v", cfg, err)
+	}
+
+	profiles := map[string]control.Profile{"agent": {}}
+	if tokens, err := loadScopedTokens("", tokenFunc(""), profiles); err != nil || tokens != nil {
+		t.Fatalf("no file must mean no scoped tokens: %v %v", tokens, err)
+	}
+	write := func(secret string) string {
+		t.Helper()
+		digest := httpapi.TokenDigest(secret)
+		path := filepath.Join(t.TempDir(), "tokens.json")
+		body := `[{"name":"ci","sha256":"` + hex.EncodeToString(digest[:]) + `","profiles":["agent"]}]`
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	tokens, err := loadScopedTokens(write("a-different-secret"), tokenFunc(""), profiles)
+	if err != nil || len(tokens) != 1 || tokens[0].Name != "ci" {
+		t.Fatalf("valid token file: %+v %v", tokens, err)
+	}
+	if _, err := loadScopedTokens(write(tokenFunc("")), tokenFunc(""), profiles); err == nil {
+		t.Fatal("a scoped entry equal to the shared token was accepted")
+	}
+	if _, err := loadScopedTokens(write("a-different-secret"), tokenFunc(""), map[string]control.Profile{"other": {}}); err == nil {
+		t.Fatal("a token for an unknown profile was accepted")
+	}
+	if _, err := loadScopedTokens(filepath.Join(t.TempDir(), "missing.json"), tokenFunc(""), profiles); err == nil {
+		t.Fatal("a missing token file was accepted")
 	}
 }
 
