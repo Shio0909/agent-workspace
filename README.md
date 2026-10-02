@@ -112,7 +112,7 @@ This project uses a single shared control token and targets a single-controller 
 
 ## Benchmarks
 
-Local kind benchmark methodology and saturation results are in [docs/benchmarks.md](docs/benchmarks.md).
+The local kind benchmark method is described in [docs/benchmarks.md](docs/benchmarks.md); run `scripts/benchmark-kind.sh` for your own numbers.
 
 ## License
 

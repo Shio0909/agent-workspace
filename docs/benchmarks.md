@@ -1,71 +1,66 @@
 # Benchmarks
 
-These measurements are local `kind` comparisons, not production capacity
-claims. The goal is to compare implementations and expose the next bottleneck.
+These are local `kind` comparisons used to find the next bottleneck, not
+capacity claims. The repository ships the method and the scripts, not result
+tables: numbers from a laptop-sized cluster do not transfer, and an earlier
+headline figure turned out not to reproduce on a later commit (see below).
+Run `scripts/benchmark-kind.sh` to produce your own. Raw output goes to
+`benchmark-results/`, which is git-ignored.
 
 ## HTTP forwarding path
 
-Environment:
+Setup: controller -> Kubernetes Service -> demo workspace, target `/health`,
+keep-alive client, several rounds per variant, same kind cluster and cached demo
+image for before/after comparisons.
 
-- macOS arm64, Docker/Colima, single-node kind
-- controller -> Kubernetes Service -> demo workspace
-- target: demo `/health`
-- keep-alive client, 3 rounds x 10 seconds
+What each change was meant to remove from the request path:
 
-| Variant | Throughput | P95 | Errors |
-| --- | ---: | ---: | ---: |
-| Serial readiness probe per request | about 38 req/s | about 600 ms | 0 |
-| 5 s ready-address cache | 850+ req/s | about 30 ms | 0 |
+- **Ready-address cache.** The baseline probes readiness serially on every
+  request. A short-lived cache of the ready endpoint removes that probe. It is
+  invalidated on start/stop changes and on proxy connection or HTTP 503
+  failures.
+- **Activity off the fsync path.** `Acquire` and `release` used to persist
+  activity to the local snapshot with a synchronous write and `fsync`. Counters
+  are now kept in memory and flushed periodically.
+- **Pooled upstream transport** for the proxy.
+- **Informer-backed read cache** with event-driven reconciliation, so steady
+  state does not issue a Deployment GET per request.
 
-The cache is invalidated on start/stop changes and proxy connection or HTTP 503
-failures. The benchmark is limited to the local demo HTTP path; it does not
-measure LLM inference or production network behavior.
+Findings that held up when re-checked on a later commit (two-node kind, kube
+read cache and ready-address cache toggled independently, several rounds):
 
-## Extended saturation run
+- The ready-address cache is the dominant factor. With it on, throughput is
+  about the same with or without the informer.
+- With the ready-address cache off, the informer helps a lot compared with a
+  Deployment read per request, but stays far below the cached path. That
+  configuration is deliberately degraded, so it is not a product number.
+- Steady-state Deployment GETs drop to zero with the informer; the remaining
+  discovery GET comes from the controller's readiness probe.
 
-A second run used the controller-to-demo forwarding path for 60 seconds.
+An earlier single-node comparison showed a much larger ratio for the cache. It
+did not reproduce on a later commit and a two-node cluster, so no ratio is
+quoted here.
 
-| Concurrency | Requests | Throughput | P99 | Errors |
-| ---: | ---: | ---: | ---: | ---: |
-| 100 | 48,511 | 807 req/s | 346 ms | 0 |
-| 200 | 28,814 | 476 req/s | 699 ms | 0 |
-
-During the 200-concurrency run, the controller used about 0.2 CPU cores and
-about 55 MiB of memory. Throughput therefore saturated before CPU or memory
-did. The next identified bottleneck is the per-request state snapshot:
-`Acquire` and `release` both persist activity to the local JSON snapshot,
-which performs a synchronous file write and `fsync`.
-
-The follow-up moved activity counters out of the request fsync path and added a
-pooled upstream transport. A later local branch also added an informer-backed
-Kubernetes read cache and event-driven reconciliation. In a two-node kind run
-with the ready-address cache disabled to expose the runtime read path, baseline
-performed Deployment GETs during steady state while the informer variant
-performed none; the remaining discovery GET came from the controller readiness
-probe. The forced-observation throughput comparison is intentionally not
-published as a product number because disabling the ready cache is a
-deliberately degraded configuration.
-
-The same run added cold-start histograms for schedule, pull, ready, and total.
-Kubernetes condition timestamps are commonly second-granular, so phase sums can
-be coarse even though the total uses the controller's real clock. Raw local
-artifacts are intentionally excluded from the repository.
+Under load the controller was bound by request handling before CPU or memory.
+The cold-start histograms (schedule, pull, ready, total) use Kubernetes
+condition timestamps, which are usually second-granular, so phase sums are
+coarse even though the total uses the controller's own clock.
 
 ## Idempotency
 
-- Same `biz_id` across 64 concurrent requests: 1 side effect.
-- Control removed: 64 concurrent requests produce 64 side effects.
+- Many concurrent requests with the same `biz_id` produce one side effect.
+- With the control removed, the same requests produce one side effect each.
 - Replaying an old successful request does not revive an already stopped
   workspace.
 
 ## Storage reclamation
 
-- Suspended workspace across 50 reconciliation rounds: 0 delete calls.
-- Grace expiry: exactly 1 hard delete.
-- Stop and restart paths: PVC is never deleted.
+- A suspended workspace across many reconciliation rounds: zero delete calls.
+- Grace expiry: exactly one hard delete.
+- Stop and restart paths never delete the PVC.
 
 ## Method notes
 
-- Same kind cluster and cached demo image for before/after comparisons.
-- Results include failed experiments rather than deleting them.
 - Benchmarks exercise the storage and HTTP control path, not model inference.
+- Failed experiments are kept in the raw output rather than deleted.
+- Claims in this file are limited to what a rerun reproduced.
