@@ -66,8 +66,12 @@ spec:
         app: agent-workspace-controller
     spec:
       serviceAccountName: agent-workspace-controller
+      # Meets the "restricted" Pod Security profile, so the namespace can enforce it.
       securityContext:
         fsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: controller
           image: agent-workspace:local
@@ -90,6 +94,10 @@ spec:
             httpGet:
               path: /ready
               port: 8090
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests: {cpu: 100m, memory: 128Mi}
             limits: {cpu: "1", memory: 512Mi}
@@ -118,3 +126,26 @@ spec:
   ports:
     - port: 8090
       targetPort: 8090
+---
+# A workspace pod accepts traffic only from the controller (the gateway and the
+# heartbeat polls). Without this, any pod in the cluster that can route to a
+# workspace can call it, and one workspace can call another; the agent inside
+# may have no authentication of its own (eino-agent runs with auth off, relying
+# on the gateway). Egress is left open: agents need their model endpoint and DNS.
+# Needs a CNI that enforces NetworkPolicy; on one that does not, this object
+# does nothing and there is no error.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-workspace-ingress
+  namespace: agent-workspace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: agent-workspace
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: agent-workspace-controller

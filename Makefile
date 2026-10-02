@@ -1,4 +1,4 @@
-.PHONY: test build vet images agent-images e2e e2e-continuity e2e-eino-agent e2e-eino-agent-faults
+.PHONY: test build vet images agent-images e2e e2e-continuity e2e-eino-agent e2e-eino-agent-faults e2e-isolation
 KIND_CLUSTER ?= agent-workspace
 
 test:
@@ -42,3 +42,10 @@ e2e-eino-agent-faults:
 	docker build --target controller -t agent-workspace:local .
 	kind load docker-image agent-workspace:local eino-agent-workspace:local --name $(KIND_CLUSTER)
 	KIND_CLUSTER=$(KIND_CLUSTER) ./scripts/kind-eino-agent-faults.sh
+
+# Pod Security "restricted" enforced on the namespace, and workspace pods
+# reachable only from the controller. Needs a CNI that enforces NetworkPolicy.
+e2e-isolation:
+	make images
+	kind load docker-image agent-workspace:local agent-workspace-demo:local --name $(KIND_CLUSTER)
+	KIND_CLUSTER=$(KIND_CLUSTER) ./scripts/kind-isolation.sh

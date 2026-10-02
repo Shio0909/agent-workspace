@@ -536,9 +536,16 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 				ObjectMeta: metav1.ObjectMeta{Labels: workspaceLabels(w)},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: ptr.To(false),
-					SecurityContext:              &corev1.PodSecurityContext{FSGroup: ptr.To(int64(1000))},
-					Containers:                   []corev1.Container{container},
-					Volumes:                      volumes,
+					// Enough for a namespace to enforce the "restricted" Pod Security
+					// profile. runAsNonRoot makes the kubelet refuse an image whose
+					// USER is root or not numeric instead of running it as root.
+					SecurityContext: &corev1.PodSecurityContext{
+						FSGroup:        ptr.To(int64(1000)),
+						RunAsNonRoot:   ptr.To(true),
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+					},
+					Containers: []corev1.Container{container},
+					Volumes:    volumes,
 				},
 			},
 		},
