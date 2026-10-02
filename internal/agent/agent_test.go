@@ -240,3 +240,44 @@ func TestChatInputValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestHeartbeatReportsBusyOnlyWhileAChatIsInFlight(t *testing.T) {
+	e := newEnv(t, "k")
+	e.agent.cfg.Version = "agent-v7"
+	e.handle = e.agent.Handler()
+	beat := func() (bool, string) {
+		rec := httptest.NewRecorder()
+		e.handle.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/heartbeat", nil))
+		var out struct {
+			Busy    bool   `json:"busy"`
+			Version string `json:"version"`
+		}
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &out) != nil {
+			t.Fatalf("heartbeat: %d %s", rec.Code, rec.Body)
+		}
+		return out.Busy, out.Version
+	}
+	if busy, version := beat(); busy || version != "agent-v7" {
+		t.Fatalf("idle agent: busy=%v version=%q", busy, version)
+	}
+	e.agent.inflight.Add(1) // a chat is being worked on
+	if busy, _ := beat(); !busy {
+		t.Fatal("an agent with a chat in flight must report busy")
+	}
+	e.agent.inflight.Add(-1)
+	if busy, _ := beat(); busy {
+		t.Fatal("busy must clear when the chat ends")
+	}
+}
+
+func TestInflightCounterIsReleasedAfterEveryChatOutcome(t *testing.T) {
+	e := newEnv(t, "k")
+	e.setCredential(1, "k")
+	e.chat("s", "hello")                  // success
+	e.chat("bad session!", "hello")       // rejected before the counter
+	e.setCredential(2, "revoked-by-peer") // provider will answer 401
+	e.chat("s", "hello again")
+	if n := e.agent.inflight.Load(); n != 0 {
+		t.Fatalf("inflight leaked: %d", n)
+	}
+}

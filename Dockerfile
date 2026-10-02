@@ -17,7 +17,11 @@ EXPOSE 8080
 ENTRYPOINT ["demo-agent"]
 
 FROM alpine:3.22 AS agent
-RUN adduser -D -u 1000 agent && mkdir /workspace && chown agent /workspace
+# CA certificates: the agent calls hosted LLM endpoints over HTTPS.
+RUN apk add --no-cache ca-certificates && \
+    adduser -D -u 1000 agent && mkdir /workspace && chown agent /workspace
+ARG AGENT_VERSION=dev
+ENV AGENT_VERSION=$AGENT_VERSION
 COPY --from=build /out/agent-runtime /usr/local/bin/agent-runtime
 USER 1000:1000
 EXPOSE 8080
