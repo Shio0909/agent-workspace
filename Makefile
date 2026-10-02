@@ -1,4 +1,4 @@
-.PHONY: test build vet images agent-images e2e e2e-continuity e2e-eino-agent
+.PHONY: test build vet images agent-images e2e e2e-continuity e2e-eino-agent e2e-eino-agent-faults
 KIND_CLUSTER ?= agent-workspace
 
 test:
@@ -34,3 +34,11 @@ e2e-eino-agent:
 	printf 'FROM eino-agent-workspace:v2\nENTRYPOINT ["false"]\n' | docker build -t eino-agent-workspace:bad -
 	kind load docker-image agent-workspace:local eino-agent-workspace:local eino-agent-workspace:v2 eino-agent-workspace:bad --name $(KIND_CLUSTER)
 	KIND_CLUSTER=$(KIND_CLUSTER) ./scripts/kind-eino-agent.sh
+
+# Failure and load checks for the same image: PostgreSQL killed, pod killed,
+# concurrent turns, knowledge base, a second workspace. Same inputs and needs
+# eino-agent-workspace:local, and it builds the controller image.
+e2e-eino-agent-faults:
+	docker build --target controller -t agent-workspace:local .
+	kind load docker-image agent-workspace:local eino-agent-workspace:local --name $(KIND_CLUSTER)
+	KIND_CLUSTER=$(KIND_CLUSTER) ./scripts/kind-eino-agent-faults.sh
