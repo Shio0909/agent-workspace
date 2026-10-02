@@ -94,6 +94,7 @@ The controller exposes a small HTTP API.
 | `DELETE` | `/v1/workspaces/{id}/credentials` | Remove the workspace's credentials |
 | `POST` | `/v1/workspaces/{id}/upgrade` | Move to an allowed image; rolls back automatically if it does not become ready |
 | `POST` | `/v1/workspaces/{id}/rollback` | Return to the previous image |
+| `PUT` | `/v1/workspaces/{id}/token-budget` | Set the workspace's LLM token budget (`0` = unlimited); at the budget it is suspended and the gateway answers 402 |
 | `GET` | `/v1/audit` | Query lifecycle audit records |
 | `ANY` | `/w/{id}/*` | Forward HTTP, SSE, and WebSocket traffic |
 
@@ -101,7 +102,7 @@ Lifecycle writes require `X-Biz-Id` for idempotency. All control-plane endpoints
 
 ## Agent workload
 
-`cmd/agent-runtime` is a small ReAct agent that runs in a workspace: it reads its LLM key from the mounted credential directory, keeps conversations on the workspace volume, and confines its file tools to one directory. Set `AGENT_CONTEXT_TOKENS` to the model's context window and a session that outgrows it is compacted: older turns become a summary, recent turns stay verbatim, and a failed summary falls back to a raw archive (`AGENT_RESERVE_TOKENS` and `AGENT_KEEP_RECENT_TOKENS` tune the budgets; see `internal/agent/compact.go`). `cmd/fake-llm` is a deterministic OpenAI-compatible endpoint for demos and tests. The `agent` profile in `configs/profiles.json` wires them together; `scripts/kind-credentials.sh` runs the rotation scenario end to end and `scripts/kind-lifecycle.sh` the upgrade, rollback and heartbeat scenarios. `cmd/agent-eval` and `scripts/llm-trial.sh` run repeated trials against any OpenAI-compatible endpoint.
+`cmd/agent-runtime` is a small ReAct agent that runs in a workspace: it reads its LLM key from the mounted credential directory, keeps conversations on the workspace volume, and confines its file tools to one directory. Set `AGENT_CONTEXT_TOKENS` to the model's context window and a session that outgrows it is compacted: older turns become a summary, recent turns stay verbatim, and a failed summary falls back to a raw archive (`AGENT_RESERVE_TOKENS` and `AGENT_KEEP_RECENT_TOKENS` tune the budgets; see `internal/agent/compact.go`). `cmd/fake-llm` is a deterministic OpenAI-compatible endpoint for demos and tests. The `agent` profile in `configs/profiles.json` wires them together; `scripts/kind-credentials.sh` runs the rotation scenario end to end and `scripts/kind-lifecycle.sh` the upgrade, rollback and heartbeat scenarios; `make e2e-continuity` checks that one conversation and its token count survive stop, idle scale-to-zero, upgrade and rollback (see [docs/state-continuity.md](docs/state-continuity.md)). The agent reports its cumulative LLM token usage in the heartbeat and the controller enforces an optional per-workspace budget (see [docs/upgrade-and-heartbeat.md](docs/upgrade-and-heartbeat.md)). `cmd/agent-eval` and `scripts/llm-trial.sh` run repeated trials against any OpenAI-compatible endpoint.
 
 ## Development
 

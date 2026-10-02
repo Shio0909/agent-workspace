@@ -25,6 +25,14 @@ type slot struct {
 	// controller restart simply starts counting again.
 	nextBeat time.Time
 	misses   int
+	// usage is the newest cumulative usage seen on a heartbeat. Like activity
+	// it is merged into the persisted copy at most once per
+	// ActivityFlushInterval, except when it crosses the budget. The flags
+	// keep a persistent anomaly from being logged or audited on every beat.
+	usage          Usage
+	usageFlushedAt time.Time
+	usageRegressed bool
+	usageRejected  bool
 	// wake 是容量为 1 的通知槽：事件驱动对账完成后唤醒正在等待这个工作区
 	// 就绪的请求，而不是让它们睡满一个 PollInterval。
 	wake chan struct{}
@@ -133,6 +141,7 @@ func (c *Controller) withActivity(w Workspace) Workspace {
 		s := v.(*slot)
 		s.mu.Lock()
 		mergeActivity(s, &w)
+		mergeUsage(s, &w)
 		s.mu.Unlock()
 	}
 	return w
@@ -184,10 +193,15 @@ func (c *Controller) FlushActivity() error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		w, err := c.store.Get(key.(string))
-		if err != nil || !s.activity.After(w.LastActivity) {
+		if err != nil {
 			return true
 		}
-		w.LastActivity = s.activity
+		stored := w
+		mergeActivity(s, &w)
+		mergeUsage(s, &w)
+		if w.LastActivity.Equal(stored.LastActivity) && w.Usage == stored.Usage {
+			return true
+		}
 		if err := c.store.Put(w); err != nil {
 			errs = append(errs, err)
 		}
@@ -262,10 +276,13 @@ func (c *Controller) SetDesired(actor, id, desired string) (Workspace, error) {
 	if w.Desired == DesiredDeleted && desired != DesiredDeleted {
 		return w, ErrConflict
 	}
-	// 挂起和过期都只能靠续期恢复：PVC 还在，但直接唤醒会让调用方一直等到
-	// 超时，因为下一轮扫描会立刻把它重新挂起。删除是唯一例外。
-	if desired != DesiredDeleted && (w.Desired == DesiredSuspended || (desired == DesiredRunning && w.expired(now))) {
-		return w, ErrExpired
+	// 挂起和过期都只能靠续期恢复（预算挂起则靠调高预算）：PVC 还在，但直接
+	// 唤醒会让调用方一直等到超时，因为下一轮扫描会立刻把它重新挂起。删除
+	// 是唯一例外。
+	if desired != DesiredDeleted {
+		if err := w.blocked(now, desired == DesiredRunning); err != nil {
+			return w, err
+		}
 	}
 	if desired != DesiredRunning && (s.active > 0 || hasLease(w, now)) {
 		return w, ErrConflict
@@ -301,8 +318,8 @@ func (c *Controller) Restart(actor, id string) (Workspace, error) {
 	if w.Desired == DesiredDeleted {
 		return w, ErrConflict
 	}
-	if w.Desired == DesiredSuspended || w.expired(now) {
-		return w, ErrExpired
+	if err := w.blocked(now, true); err != nil {
+		return w, err
 	}
 	if s.active > 0 || hasLease(w, now) {
 		return w, ErrConflict
@@ -338,7 +355,8 @@ func (c *Controller) SetExpiry(actor, id string, expiresAt time.Time) (Workspace
 	now := c.now()
 	w.ExpiresAt, w.UpdatedAt = expiresAt, now
 	action, detail := ActionExpirySet, "expires_at="+formatDeadline(expiresAt)
-	if w.Desired == DesiredSuspended && (expiresAt.IsZero() || now.Before(expiresAt)) {
+	// A budget suspension is lifted by the budget, not by a new deadline.
+	if w.Desired == DesiredSuspended && w.SuspendedFor != SuspendedForBudget && (expiresAt.IsZero() || now.Before(expiresAt)) {
 		w.Desired, w.SuspendedAt = DesiredStopped, time.Time{}
 		action, detail = ActionResume, "resumed with expires_at="+formatDeadline(expiresAt)
 	}
@@ -374,8 +392,8 @@ func (c *Controller) Lease(actor, id, token string, ttl time.Duration) (string, 
 		return "", err
 	}
 	now := c.now()
-	if w.Desired == DesiredSuspended || w.expired(now) {
-		return "", ErrExpired
+	if err := w.blocked(now, true); err != nil {
+		return "", err
 	}
 	if w.Desired != DesiredRunning {
 		return "", ErrConflict
@@ -441,8 +459,8 @@ func (c *Controller) Acquire(ctx context.Context, id string) (string, func(), er
 	if err == nil && w.Desired == DesiredDeleted {
 		err = ErrConflict
 	}
-	if err == nil && (w.Desired == DesiredSuspended || w.expired(c.now())) {
-		err = ErrExpired
+	if err == nil {
+		err = w.blocked(c.now(), true)
 	}
 	woke := false
 	if err == nil {
@@ -554,6 +572,7 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 	now := c.now()
 	persisted := w.LastActivity
 	mergeActivity(s, &w)
+	mergeUsage(s, &w)
 	decision := c.reclaim(&w, now, s.active > 0 || hasLease(w, now))
 	if !decision.changed && w.LastActivity.Sub(persisted) >= c.ActivityFlushInterval && w.LastActivity.After(persisted) {
 		// Periodic flush for workspaces which stay busy: the scheduler visits
@@ -633,6 +652,9 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 		return "", fmt.Errorf("invalid persisted desired state %q", w.Desired)
 	}
 	w.LastError = ""
+	if err == nil && w.Desired == DesiredSuspended && w.SuspendedFor == SuspendedForBudget {
+		w.LastError = budgetMessage(w)
+	}
 	if err != nil {
 		w.Phase, w.LastError = PhaseError, err.Error()
 	}
@@ -733,7 +755,10 @@ func (c *Controller) applyExpiry(w *Workspace, now time.Time, busy bool) reclaim
 		c.audit(ActorSystem, ActionExpire, w.ID, "deadline "+deadline+" passed, volume retained", ResultOK)
 		return reclaimDecision{changed: true}
 	case DesiredSuspended:
-		if busy || w.SuspendedAt.IsZero() || now.Sub(w.SuspendedAt) < c.GracePeriod {
+		// A budget suspension never ends in a hard delete: running out of tokens
+		// is not a reason to destroy the volume, and only a person can say the
+		// data is no longer wanted.
+		if busy || w.SuspendedFor == SuspendedForBudget || w.SuspendedAt.IsZero() || now.Sub(w.SuspendedAt) < c.GracePeriod {
 			return reclaimDecision{}
 		}
 		w.Desired, w.UpdatedAt, w.DeletionReason = DesiredDeleted, now, DeletedByGrace

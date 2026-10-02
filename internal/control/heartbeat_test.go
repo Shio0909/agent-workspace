@@ -16,8 +16,10 @@ type workload struct {
 	status  atomic.Int64
 	busy    atomic.Bool
 	version atomic.Value
-	hits    atomic.Int64
-	block   chan struct{}
+	// usage is the raw JSON of the "usage" member; empty omits it.
+	usage atomic.Value
+	hits  atomic.Int64
+	block chan struct{}
 }
 
 func newWorkload(t *testing.T) *workload {
@@ -25,6 +27,7 @@ func newWorkload(t *testing.T) *workload {
 	w := &workload{}
 	w.status.Store(http.StatusOK)
 	w.version.Store("v1")
+	w.usage.Store("")
 	w.srv = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		w.hits.Add(1)
 		if w.block != nil {
@@ -37,7 +40,11 @@ func newWorkload(t *testing.T) *workload {
 			rw.WriteHeader(code)
 			return
 		}
-		_, _ = rw.Write([]byte(`{"busy":` + map[bool]string{true: "true", false: "false"}[w.busy.Load()] + `,"version":"` + w.version.Load().(string) + `"}`))
+		extra := ""
+		if u := w.usage.Load().(string); u != "" {
+			extra = `,"usage":` + u
+		}
+		_, _ = rw.Write([]byte(`{"busy":` + map[bool]string{true: "true", false: "false"}[w.busy.Load()] + `,"version":"` + w.version.Load().(string) + `"` + extra + `}`))
 	}))
 	t.Cleanup(w.srv.Close)
 	return w
@@ -62,18 +69,20 @@ type beatEnv struct {
 	r   *beatRuntime
 	w   *workload
 	now time.Time
+	dir string
 }
 
 func newBeatEnv(t *testing.T, path string) *beatEnv {
 	t.Helper()
-	s, err := OpenStore(t.TempDir())
+	dir := t.TempDir()
+	s, err := OpenStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	r := &beatRuntime{}
 	c := New(s, r, map[string]Profile{"agent": {HeartbeatPath: path}}, 24*time.Hour)
-	e := &beatEnv{t: t, c: c, r: r, w: newWorkload(t), now: time.Now()}
+	e := &beatEnv{t: t, c: c, r: r, w: newWorkload(t), now: time.Now(), dir: dir}
 	r.url = e.w.srv.URL
 	c.now = func() time.Time { return e.now }
 	c.started = e.now.Add(-time.Hour)

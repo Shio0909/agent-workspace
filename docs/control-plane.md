@@ -186,6 +186,8 @@ suspended --宽限期满--> deleted        （硬删 Deployment/Service/PVC）
 | `nc_hard_deletes_total` | counter | Deployment/Service/PVC 被删除的次数。 |
 | `nc_operations_started_total` / `nc_operation_replays_total` / `nc_operation_takeovers_total` | counter | 首次提交 / 重放 / 接管陈旧记录。 |
 | `nc_audit_failures_total` | counter | 写审计失败的次数。 |
+| `nc_tokens_total{profile,kind}` | counter | 心跳上报的 token 增量，`kind` 为 `prompt` 或 `completion`。没有工作区标签（基数）；上报回退的那段不计入。 |
+| `nc_budget_suspensions_total{profile}` | counter | 因 token 预算用尽被挂起的次数。 |
 | `nc_event_reconciles_total` / `nc_event_reconcile_failures_total` | counter | 事件驱动对账次数，以及失败并重新入队的次数。 |
 | `nc_workspace_acquire_seconds` | histogram | 请求等待可用 endpoint 的耗时。 |
 | `nc_workspace_start_seconds{phase}` | histogram | 冷启动的 schedule、pull、ready、total 分阶段耗时。 |
@@ -269,6 +271,8 @@ suspended --宽限期满--> deleted        （硬删 Deployment/Service/PVC）
 | 审计文件末尾有半行 | 打开时补换行，损坏被限制在一条记录内；坏行被查询跳过 | 半行那条记录可读 |
 | 删除存储前进程被杀 | 意图（`Desired=deleted`）仍在，重启后重删 | 删除已完成 |
 | 停机超时 | 未完成的对账在下次启动重做 | 在途请求一定完成 |
+| 预算越线后控制器立刻崩溃 | 挂起先落盘再停工作负载；重启后不重复审计、不重复计数，下一轮对账停掉负载 | 越线前最近一个刷新间隔内的用量（崩溃会丢，但不会丢挂起） |
+| 工作负载丢卷后从 0 重新计数 | 控制器保留已记录的较大值，写一条 `usage-regressed` 审计 | 补上回退之前的用量（无法区分重置与错误数字） |
 
 ---
 
@@ -330,3 +334,20 @@ printf %s "$TOKEN" | shasum -a 256 | cut -d' ' -f1  # 写进文件（Linux 用 s
 - **幂等键 `biz_id` 是全局的**，不按令牌隔离。两个令牌对不同工作区用了同一个 `biz_id`，后到的会得到 409。调用方应使用带自己前缀的 `biz_id`。
 - **共享令牌仍然无所不能**。它应当只留给运维，不要发给调用方。
 - 没有速率限制，一个作用域令牌仍可以占满控制面。
+
+---
+
+## 12. 用量计量与 token 预算
+
+工作负载在心跳回复里可选地带上累计用量 `usage:{prompt_tokens,completion_tokens,total_tokens}`；控制器只读这三个数，不关心它来自哪个模型。完整契约、校验规则和端点见 [upgrade-and-heartbeat.md](upgrade-and-heartbeat.md)。这里只记录取舍和不变量。
+
+- **累计且单调**：计数器由工作负载持有，控制器取逐字段最大值，从不把心跳相加。丢失、重复、乱序的心跳不会改变总数。
+- **低于已记录值的上报被忽略**：审计一条 `usage-regressed`（每次回退只记一次），回退期间的 token 不进 `nc_tokens_total`。
+- **预算越线立即落盘**：`total_tokens >= token_budget` 时，工作区先被持久化为 `Desired=suspended`、`SuspendedFor=token_budget`，再由对账停工作负载；存储保留。用量本身只按 `-activity-flush` 间隔落盘。
+- **复用挂起状态**：预算挂起和租约挂起共用 `Desired=suspended`，用 `SuspendedFor` 区分。`blocked()` 对预算挂起返回 `ErrBudgetExceeded`（HTTP 402），租约过期仍是 `ErrExpired`（410）。402 与 410 分开，是因为恢复手段不同：提高预算，而不是续租。
+- **续租不解除预算挂起**；提高预算到用量之上（或设为 0）解除，工作区回到 `stopped`，下一次请求唤醒。如果租约同时已过期，它转为租约挂起，宽限期重新计时。
+- **预算挂起不会被宽限期硬删**：删除存储必须是显式的 `DELETE`。这是有意的取舍：因为花钱超限而丢掉用户的会话数据，比多留一个挂起的卷更糟。代价是这类卷不会被自动回收。
+- **越线有超调**：执行靠心跳，当前这一轮对话会完成。预算限制成本的量级，不是硬上限。
+- **上报可信度**：工作负载谎报用量即可绕过预算。预算不是安全边界。
+
+测试：`internal/control/usage_test.go`（契约校验、单调性与回退、立即落盘、挂起/唤醒/恢复、重启后保持、不被宽限期删除、402 的网关行为、指标）、`internal/httpapi/usage_test.go`（端点校验、幂等重放、作用域令牌 404）。
