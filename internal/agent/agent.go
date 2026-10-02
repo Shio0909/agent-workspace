@@ -56,6 +56,16 @@ type Config struct {
 	// LLMRetries is the number of extra attempts after a transient failure.
 	LLMRetries   int
 	RetryBackoff time.Duration
+
+	// ContextTokens is the model's context window. Zero turns compaction off
+	// and sessions are replayed whole, which is the behaviour before it
+	// existed. See compact.go.
+	ContextTokens int
+	// ReserveTokens is room kept free for the answer. Default 1024.
+	ReserveTokens int
+	// KeepRecentTokens is how much recent conversation survives a compaction
+	// verbatim. Default and ceiling: a quarter of the usable window.
+	KeepRecentTokens int
 }
 
 type Agent struct {
@@ -80,6 +90,7 @@ func New(cfg Config) *Agent {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: cfg.LLMTimeout}
 	}
+	cfg = cfg.withCompactionDefaults()
 	return &Agent{cfg: cfg}
 }
 
@@ -88,6 +99,9 @@ type message struct {
 	Content    string     `json:"content,omitempty"`
 	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+
+	// finish is how the provider ended this reply. It is never sent or stored.
+	finish string
 }
 
 type toolCall struct {
@@ -202,10 +216,21 @@ func (a *Agent) chat(w http.ResponseWriter, r *http.Request) {
 // before every model call, so a rotation takes effect mid-conversation without
 // a restart. It returns the version used by the last call.
 func (a *Agent) run(ctx context.Context, session, text string) (string, int, int, error) {
-	history, err := a.loadSession(session)
+	records, err := a.loadSession(session)
 	if err != nil {
 		return "", 0, 0, err
 	}
+	st := a.loadState(session, records)
+	version := 0
+	if a.cfg.ContextTokens > 0 {
+		// Only at a turn boundary: stored sessions hold complete turns, and a
+		// single turn is bounded by MaxSteps and maxToolOutput, so it is the
+		// accumulation across turns that can outgrow the window.
+		if st, version, err = a.compact(ctx, session, st, text); err != nil {
+			return "", 0, version, err
+		}
+	}
+	history := st.history()
 	// A turn is written to the session only once it has a final answer. If
 	// the model call fails (for example a revoked key) and the caller retries,
 	// the retries must not pile up unanswered user messages in the history.
@@ -215,7 +240,6 @@ func (a *Agent) run(ctx context.Context, session, text string) (string, int, int
 		history = append(history, m)
 	}
 	add(message{Role: "user", Content: text})
-	version := 0
 	for step := 1; step <= a.cfg.MaxSteps; step++ {
 		cred, err := a.LoadCredential()
 		version = cred.Version
@@ -245,7 +269,20 @@ func (a *Agent) run(ctx context.Context, session, text string) (string, int, int
 // retried here, below the turn: a retry never duplicates anything in history.
 // A rejected credential is not transient and is returned at once.
 func (a *Agent) complete(ctx context.Context, apiKey string, history []message) (message, error) {
-	body, err := json.Marshal(map[string]any{"model": a.cfg.Model, "messages": history, "tools": toolSpecs()})
+	return a.chatCompletion(ctx, apiKey, history, toolSpecs(), 0)
+}
+
+// chatCompletion is complete with the tools and the completion cap chosen by
+// the caller; a summarisation call offers no tools.
+func (a *Agent) chatCompletion(ctx context.Context, apiKey string, history []message, tools []map[string]any, maxTokens int) (message, error) {
+	req := map[string]any{"model": a.cfg.Model, "messages": history}
+	if len(tools) > 0 {
+		req["tools"] = tools
+	}
+	if maxTokens > 0 {
+		req["max_tokens"] = maxTokens
+	}
+	body, err := json.Marshal(req)
 	if err != nil {
 		return message{}, err
 	}
@@ -293,7 +330,8 @@ func (a *Agent) completeOnce(ctx context.Context, apiKey string, body []byte) (m
 	}
 	var out struct {
 		Choices []struct {
-			Message message `json:"message"`
+			Message      message `json:"message"`
+			FinishReason string  `json:"finish_reason"`
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil || len(out.Choices) == 0 {
@@ -301,6 +339,7 @@ func (a *Agent) completeOnce(ctx context.Context, apiKey string, body []byte) (m
 	}
 	m := out.Choices[0].Message
 	m.Role = "assistant"
+	m.finish = out.Choices[0].FinishReason
 	return m, false, nil
 }
 

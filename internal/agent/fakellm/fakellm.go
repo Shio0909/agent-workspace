@@ -19,6 +19,28 @@ type Server struct {
 	keys     map[string]bool
 	rejected int
 	served   int
+
+	// Summarisation requests (a system message that says "summarization
+	// assistant") are counted apart from chat requests, so a test can tell the
+	// size of the history the agent sends from the cost of shrinking it.
+	summaries     int
+	maxMessages   int
+	failSummaries bool
+	cutSummaries  bool
+}
+
+// FailSummaries makes summarisation requests fail with a 500.
+func (s *Server) FailSummaries(on bool) { s.mu.Lock(); s.failSummaries = on; s.mu.Unlock() }
+
+// TruncateSummaries makes summarisation requests stop at the token cap.
+func (s *Server) TruncateSummaries(on bool) { s.mu.Lock(); s.cutSummaries = on; s.mu.Unlock() }
+
+// Stats reports how many summarisation requests were served and the longest
+// message list any chat request carried.
+func (s *Server) Stats() (summaries, maxMessages int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.summaries, s.maxMessages
 }
 
 func New(keys ...string) *Server {
@@ -55,7 +77,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/stats", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]int{"served": s.served, "rejected": s.rejected, "keys": len(s.keys)})
+		_ = json.NewEncoder(w).Encode(map[string]int{
+			"served": s.served, "rejected": s.rejected, "keys": len(s.keys),
+			"summaries": s.summaries, "max_messages": s.maxMessages,
+		})
 	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { _, _ = fmt.Fprintln(w, "ok") })
 	return mux
@@ -98,6 +123,13 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	if in.Messages[0].Role == "system" && strings.Contains(in.Messages[0].Content, "summarization assistant") {
+		s.summarize(w, in.Messages[len(in.Messages)-1].Content)
+		return
+	}
+	s.mu.Lock()
+	s.maxMessages = max(s.maxMessages, len(in.Messages))
+	s.mu.Unlock()
 	last := in.Messages[len(in.Messages)-1]
 	if last.Role == "user" {
 		last.Content = s.pause(r, last.Content)
@@ -125,6 +157,36 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": reply}}})
+}
+
+// summarize answers a summarisation request with a summary that names the
+// first words of every user line in the transcript, and says whether it was
+// merged into a previous summary, so a test can check what was carried over.
+func (s *Server) summarize(w http.ResponseWriter, prompt string) {
+	s.mu.Lock()
+	s.summaries++
+	n, fail, cut := s.summaries, s.failSummaries, s.cutSummaries
+	s.mu.Unlock()
+	if fail {
+		http.Error(w, "summarizer down", http.StatusInternalServerError)
+		return
+	}
+	var users []string
+	for _, line := range strings.Split(prompt, "\n") {
+		if text, ok := strings.CutPrefix(line, "[User]: "); ok {
+			text = strings.Join(strings.Fields(text), " ")
+			users = append(users, text[:min(len(text), 12)])
+		}
+	}
+	merged := strings.Contains(prompt, "<previous-summary>")
+	choice := map[string]any{"message": map[string]any{
+		"role": "assistant", "content": fmt.Sprintf("## Goal\nsummary#%d merged=%v users=[%s]", n, merged, strings.Join(users, "|")),
+	}}
+	if cut {
+		choice["finish_reason"] = "length"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{choice}})
 }
 
 // pause implements the "sleep <ms> <text>" prefix and returns the text to
