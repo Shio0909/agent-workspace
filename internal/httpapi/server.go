@@ -205,6 +205,35 @@ func (s *Server) Handler() http.Handler {
 		}
 		respond(w, http.StatusOK, info)
 	})
+	// 升级只记录意图并立即返回 202：结果由对账循环判定，调用方轮询工作区的
+	// upgrade / last_upgrade 字段。重复提交同一个目标是 no-op。
+	mux.HandleFunc("POST /v1/workspaces/{id}/upgrade", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Image          string `json:"image"`
+			TimeoutSeconds int    `json:"timeout_seconds"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		if in.TimeoutSeconds < 0 || in.TimeoutSeconds > 86400 { // bound it before converting, so the multiplication cannot overflow
+			fail(w, control.ErrInvalid)
+			return
+		}
+		item, err := s.Controller.Upgrade(s.actor(r), r.PathValue("id"), in.Image, time.Duration(in.TimeoutSeconds)*time.Second)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		respond(w, http.StatusAccepted, item)
+	})
+	mux.HandleFunc("POST /v1/workspaces/{id}/rollback", func(w http.ResponseWriter, r *http.Request) {
+		item, err := s.Controller.Rollback(s.actor(r), r.PathValue("id"))
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		respond(w, http.StatusAccepted, item)
+	})
 	mux.HandleFunc("POST /v1/workspaces/{id}/leases", s.lease)
 	mux.HandleFunc("PUT /v1/workspaces/{id}/leases/{lease}", s.lease)
 	mux.HandleFunc("DELETE /v1/workspaces/{id}/leases/{lease}", func(w http.ResponseWriter, r *http.Request) {

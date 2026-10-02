@@ -122,6 +122,8 @@ func (r *Runtime) Observe(ctx context.Context, w control.Workspace, p control.Pr
 		return obs, nil
 	}
 
+	obs.Image = rolledOutImage(d)
+
 	health := target
 	health.Path = p.HealthPath
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -142,6 +144,23 @@ func (r *Runtime) Observe(ctx context.Context, w control.Workspace, p control.Pr
 	defer resp.Body.Close()
 	obs.Ready = resp.StatusCode >= 200 && resp.StatusCode < 300
 	return obs, nil
+}
+
+// rolledOutImage returns the workload image once every replica is the updated
+// one and ready, and "" while a rollout is still in progress. ReadyReplicas
+// alone is not enough: right after the spec changes, the old pod is still
+// ready and would look like a successful upgrade.
+func rolledOutImage(d *appsv1.Deployment) string {
+	if d.Spec.Replicas == nil || len(d.Spec.Template.Spec.Containers) == 0 {
+		return ""
+	}
+	want := *d.Spec.Replicas
+	st := d.Status
+	if want == 0 || st.ObservedGeneration < d.Generation || st.UpdatedReplicas < want ||
+		st.ReadyReplicas < want || st.Replicas != st.UpdatedReplicas {
+		return ""
+	}
+	return d.Spec.Template.Spec.Containers[0].Image
 }
 
 func (r *Runtime) Ensure(ctx context.Context, w control.Workspace, p control.Profile) error {

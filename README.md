@@ -18,6 +18,7 @@ It manages one Deployment, Service, and PersistentVolumeClaim per workspace. Wor
 - Readiness-aware HTTP and SSE/WebSocket forwarding.
 - Audit trail, cold-start histograms, and Prometheus-compatible metrics.
 - Per-workspace credential injection and rotation: the LLM key lives in a Kubernetes Secret mounted as files, so an agent picks up a new key without a pod restart. See [docs/agent-credentials.md](docs/agent-credentials.md).
+- Image upgrade with automatic rollback, and a heartbeat that restarts a stuck workspace. See [docs/upgrade-and-heartbeat.md](docs/upgrade-and-heartbeat.md).
 
 ## Architecture
 
@@ -87,6 +88,8 @@ The controller exposes a small HTTP API.
 | `PUT` | `/v1/workspaces/{id}/credentials` | Replace the workspace's credentials (returns version and key names only) |
 | `GET` | `/v1/workspaces/{id}/credentials` | Credential metadata, never values |
 | `DELETE` | `/v1/workspaces/{id}/credentials` | Remove the workspace's credentials |
+| `POST` | `/v1/workspaces/{id}/upgrade` | Move to an allowed image; rolls back automatically if it does not become ready |
+| `POST` | `/v1/workspaces/{id}/rollback` | Return to the previous image |
 | `GET` | `/v1/audit` | Query lifecycle audit records |
 | `ANY` | `/w/{id}/*` | Forward HTTP, SSE, and WebSocket traffic |
 
@@ -94,7 +97,7 @@ Lifecycle writes require `X-Biz-Id` for idempotency. All control-plane endpoints
 
 ## Agent workload
 
-`cmd/agent-runtime` is a small ReAct agent that runs in a workspace: it reads its LLM key from the mounted credential directory, keeps conversations on the workspace volume, and confines its file tools to one directory. `cmd/fake-llm` is a deterministic OpenAI-compatible endpoint for demos and tests. The `agent` profile in `configs/profiles.json` wires them together; `scripts/kind-credentials.sh` runs the rotation scenario end to end.
+`cmd/agent-runtime` is a small ReAct agent that runs in a workspace: it reads its LLM key from the mounted credential directory, keeps conversations on the workspace volume, and confines its file tools to one directory. `cmd/fake-llm` is a deterministic OpenAI-compatible endpoint for demos and tests. The `agent` profile in `configs/profiles.json` wires them together; `scripts/kind-credentials.sh` runs the rotation scenario end to end and `scripts/kind-lifecycle.sh` the upgrade, rollback and heartbeat scenarios. `cmd/agent-eval` and `scripts/llm-trial.sh` run repeated trials against any OpenAI-compatible endpoint.
 
 ## Development
 

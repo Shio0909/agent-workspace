@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -20,6 +21,10 @@ type slot struct {
 	// path never waits for an fsync. It is merged into the persisted
 	// LastActivity at most once per ActivityFlushInterval, and on shutdown.
 	activity time.Time
+	// nextBeat and misses are heartbeat bookkeeping. They live in memory: a
+	// controller restart simply starts counting again.
+	nextBeat time.Time
+	misses   int
 	// wake 是容量为 1 的通知槽：事件驱动对账完成后唤醒正在等待这个工作区
 	// 就绪的请求，而不是让它们睡满一个 PollInterval。
 	wake chan struct{}
@@ -65,6 +70,18 @@ type Controller struct {
 	// while requests keep arriving. Zero persists every request, which is the
 	// original behaviour and is kept for controlled benchmarks.
 	ActivityFlushInterval time.Duration
+	// UpgradeSettle is how long a workspace must stay ready on the new image
+	// before an upgrade is committed. A workload that starts and then crashes
+	// is ready for a moment too, so readiness alone is not enough.
+	UpgradeSettle time.Duration
+	// HeartbeatInterval spaces the polls of one workspace; HeartbeatMisses
+	// consecutive failures mark it unresponsive and trigger a restart, at most
+	// once per RestartCooldown so a workload that crashes on start is not
+	// restarted in a tight loop.
+	HeartbeatInterval time.Duration
+	HeartbeatMisses   int
+	RestartCooldown   time.Duration
+	HeartbeatClient   *http.Client
 	// Metrics 由 New 初始化，控制器内部只做原子自增。
 	Metrics *Metrics
 
@@ -86,7 +103,10 @@ func New(store *Store, runtime Runtime, profiles map[string]Profile, idle time.D
 		GracePeriod: 24 * time.Hour, StartupGrace: time.Minute, OperationLease: 10 * time.Minute,
 		ProbeTimeout: 3 * time.Second, ReadyTTL: 2 * time.Second,
 		ActivityFlushInterval: DefaultActivityFlushInterval,
-		Metrics:               &Metrics{}, now: time.Now, started: time.Now(), queue: newEventQueue()}
+		UpgradeSettle:         15 * time.Second,
+		HeartbeatInterval:     10 * time.Second, HeartbeatMisses: 3, RestartCooldown: 5 * time.Minute,
+		HeartbeatClient: &http.Client{Timeout: 2 * time.Second},
+		Metrics:         &Metrics{}, now: time.Now, started: time.Now(), queue: newEventQueue()}
 }
 
 func (c *Controller) slot(id string) *slot {
@@ -526,10 +546,11 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 	if w.Phase == PhaseDeleted {
 		return "", nil
 	}
-	p, ok := c.profiles[w.Profile]
+	base, ok := c.profiles[w.Profile]
 	if !ok {
 		return "", fmt.Errorf("unknown persisted profile %q", w.Profile)
 	}
+	p, _ := c.profileFor(w)
 	now := c.now()
 	persisted := w.LastActivity
 	mergeActivity(s, &w)
@@ -559,6 +580,20 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 	case DesiredRunning:
 		var obs Observation
 		obs, err = c.runtime.Observe(opCtx, w, p)
+		if err == nil && w.Upgrade != nil {
+			obs = c.verifyUpgrade(&w, base, obs, now)
+			// A rollback changed the image; apply the one the workspace now has.
+			p, _ = c.profileFor(w)
+		}
+		if err == nil && w.RolloutPending {
+			if obs.Ready && (obs.Image == p.Image || obs.Image == "") {
+				w.RolloutPending = false
+			} else {
+				// The old image is still serving: not ready for the purposes of
+				// this reconcile, so that Ensure applies the new one.
+				obs.Ready = false
+			}
+		}
 		if err == nil && !obs.Ready {
 			// Record t0 before Ensure: the Deployment API call and scheduler can
 			// create and schedule a Pod before Ensure returns.
@@ -572,6 +607,7 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 			// restarting a Deployment which does not exist yet would fail.
 			if err = c.runtime.Restart(opCtx, w); err == nil {
 				w.RestartPending, w.Phase = false, PhaseStarting
+				w.HeartbeatAt = time.Time{}
 			}
 			break
 		}
@@ -582,10 +618,14 @@ func (c *Controller) Reconcile(ctx context.Context, id string) (endpoint string,
 	case DesiredStopped:
 		err = c.runtime.Stop(opCtx, w)
 		w.Phase = PhaseStopped
+		pauseUpgrade(&w)
+		w.HeartbeatAt = time.Time{}
 	case DesiredSuspended:
 		// Suspension stops the workload but never its storage.
 		err = c.runtime.Stop(opCtx, w)
 		w.Phase = PhaseSuspended
+		pauseUpgrade(&w)
+		w.HeartbeatAt = time.Time{}
 	case DesiredDeleted:
 		err = c.runtime.Delete(opCtx, w)
 		w.Phase = PhaseDeleted
