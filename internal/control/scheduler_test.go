@@ -149,7 +149,14 @@ func TestRoundTimeoutStopsDispatching(t *testing.T) {
 	r := &concurrencyRuntime{delay: 30 * time.Millisecond}
 	c := New(s, r, map[string]Profile{"demo": {}}, time.Hour)
 	for i := 0; i < 40; i++ {
-		seed(t, c, fmt.Sprintf("w-%02d", i))
+		id := fmt.Sprintf("w-%02d", i)
+		seed(t, c, id)
+		// Only a desired-running workspace reaches Observe, which is where the
+		// runtime fake sleeps. A stopped one never blocks, so the round could
+		// finish inside the timeout on a machine with a fast disk.
+		if _, err := c.SetDesired(testActor, id, DesiredRunning); err != nil {
+			t.Fatal(err)
+		}
 	}
 	scheduler := NewScheduler(c)
 	scheduler.BatchSize, scheduler.Concurrency, scheduler.RoundTimeout = 8, 2, 60*time.Millisecond
