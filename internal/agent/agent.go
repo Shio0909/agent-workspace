@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -42,17 +43,25 @@ var ErrCredentialRejected = errors.New("llm endpoint rejected the credential")
 
 type Config struct {
 	WorkspaceID   string
+	Version       string // reported on /heartbeat so an upgrade can be observed
 	WorkspaceDir  string // persistent volume; sessions and files live here
 	CredentialDir string // read-only Secret mount
 	LLMBaseURL    string // OpenAI-compatible base URL, without /chat/completions
 	Model         string
 	MaxSteps      int
 	HTTPClient    *http.Client
+	// LLMTimeout bounds one model call. Hosted reasoning models can take well
+	// over a minute on a busy day, so the default is generous.
+	LLMTimeout time.Duration
+	// LLMRetries is the number of extra attempts after a transient failure.
+	LLMRetries   int
+	RetryBackoff time.Duration
 }
 
 type Agent struct {
 	cfg      Config
 	sessions sync.Map // session id -> *sync.Mutex
+	inflight atomic.Int64
 }
 
 func New(cfg Config) *Agent {
@@ -62,8 +71,14 @@ func New(cfg Config) *Agent {
 	if cfg.Model == "" {
 		cfg.Model = "default"
 	}
+	if cfg.LLMTimeout <= 0 {
+		cfg.LLMTimeout = 180 * time.Second
+	}
+	if cfg.RetryBackoff <= 0 {
+		cfg.RetryBackoff = 500 * time.Millisecond
+	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 60 * time.Second}
+		cfg.HTTPClient = &http.Client{Timeout: cfg.LLMTimeout}
 	}
 	return &Agent{cfg: cfg}
 }
@@ -129,6 +144,12 @@ func (a *Agent) Handler() http.Handler {
 		_, _ = io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("GET /status", a.status)
+	// The controller polls this. busy means a chat is being worked on, which
+	// the controller treats as activity so the idle reaper cannot stop the
+	// workspace between a request and its answer.
+	mux.HandleFunc("GET /heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"busy": a.inflight.Load() > 0, "version": a.cfg.Version})
+	})
 	mux.HandleFunc("POST /v1/chat", a.chat)
 	return mux
 }
@@ -138,6 +159,7 @@ func (a *Agent) status(w http.ResponseWriter, r *http.Request) {
 	entries, _ := os.ReadDir(filepath.Join(a.cfg.WorkspaceDir, "sessions"))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"workspace":          a.cfg.WorkspaceID,
+		"version":            a.cfg.Version,
 		"credential_version": cred.Version,
 		"has_credential":     err == nil,
 		"sessions":           len(entries),
@@ -156,6 +178,8 @@ func (a *Agent) chat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session must match [A-Za-z0-9_-]{1,64} and message must be 1 to 8192 bytes"})
 		return
 	}
+	a.inflight.Add(1)
+	defer a.inflight.Add(-1)
 	lock, _ := a.sessions.LoadOrStore(in.Session, &sync.Mutex{})
 	lock.(*sync.Mutex).Lock()
 	defer lock.(*sync.Mutex).Unlock()
@@ -216,27 +240,56 @@ func (a *Agent) run(ctx context.Context, session, text string) (string, int, int
 	return "", a.cfg.MaxSteps, version, fmt.Errorf("no final answer after %d steps", a.cfg.MaxSteps)
 }
 
+// complete asks the model for the next message. A chat completion has no side
+// effect on our side, so transient failures (network errors, 429, 5xx) are
+// retried here, below the turn: a retry never duplicates anything in history.
+// A rejected credential is not transient and is returned at once.
 func (a *Agent) complete(ctx context.Context, apiKey string, history []message) (message, error) {
 	body, err := json.Marshal(map[string]any{"model": a.cfg.Model, "messages": history, "tools": toolSpecs()})
 	if err != nil {
 		return message{}, err
 	}
+	var lastErr error
+	for attempt := 0; attempt <= a.cfg.LLMRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return message{}, ctx.Err()
+			case <-time.After(a.cfg.RetryBackoff << (attempt - 1)):
+			}
+		}
+		m, retryable, err := a.completeOnce(ctx, apiKey, body)
+		if err == nil {
+			return m, nil
+		}
+		lastErr = err
+		if !retryable {
+			break
+		}
+	}
+	return message{}, lastErr
+}
+
+func (a *Agent) completeOnce(ctx context.Context, apiKey string, body []byte) (message, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(a.cfg.LLMBaseURL, "/")+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return message{}, err
+		return message{}, false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	resp, err := a.cfg.HTTPClient.Do(req)
 	if err != nil {
-		return message{}, fmt.Errorf("call llm: %w", err)
+		// The caller going away is not worth retrying; a timeout or reset is.
+		return message{}, ctx.Err() == nil, fmt.Errorf("call llm: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return message{}, ErrCredentialRejected
-	}
-	if resp.StatusCode != http.StatusOK {
-		return message{}, fmt.Errorf("llm returned status %d", resp.StatusCode)
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return message{}, false, ErrCredentialRejected
+	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+		return message{}, true, fmt.Errorf("llm returned status %d", resp.StatusCode)
+	case resp.StatusCode != http.StatusOK:
+		return message{}, false, fmt.Errorf("llm returned status %d", resp.StatusCode)
 	}
 	var out struct {
 		Choices []struct {
@@ -244,11 +297,11 @@ func (a *Agent) complete(ctx context.Context, apiKey string, history []message) 
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil || len(out.Choices) == 0 {
-		return message{}, errors.New("llm returned an unreadable response")
+		return message{}, true, errors.New("llm returned an unreadable response")
 	}
 	m := out.Choices[0].Message
 	m.Role = "assistant"
-	return m, nil
+	return m, false, nil
 }
 
 func (a *Agent) sessionPath(session string) string {
