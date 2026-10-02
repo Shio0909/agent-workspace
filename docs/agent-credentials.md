@@ -38,11 +38,11 @@ DELETE /v1/workspaces/{id}/credentials  清除
 
 ## 轮换延迟
 
-kubelet 刷新挂载的 Secret 文件靠它自己的同步周期，不是即时的。本地 kind 上不做任何处理时，从 PUT 返回到 agent 读到新 Key 要 **73 秒和 75 秒**（两次）。
+kubelet 刷新挂载的 Secret 文件靠它自己的同步周期，不是即时的，通常是分钟量级。
 
-控制器在写完 Secret 后，给该工作区的 Pod 加一个版本注解。这个改动不碰 Pod 模板，不会滚动，但 Pod 对象的更新会让 kubelet 立刻同步卷。同样环境下延迟变成 **1.25 秒和 1.24 秒**（两次）。注解失败只记日志，kubelet 仍会按自己的周期收敛，所以它只影响速度，不影响正确性。
+控制器在写完 Secret 后，给该工作区的 Pod 加一个版本注解。这个改动不碰 Pod 模板，不会滚动，但 Pod 对象的更新会让 kubelet 立刻同步卷，延迟降到秒级。注解失败只记日志，kubelet 仍会按自己的周期收敛，所以它只影响速度，不影响正确性。
 
-这些数字来自双节点 kind、fake LLM、每种各两次，只说明量级，不是 SLA。复现：`scripts/kind-credentials.sh`。
+`scripts/kind-credentials.sh` 会打印实测的轮换延迟，需要时自己跑一遍。仓库不附结果数字。
 
 ## 验证了什么
 
