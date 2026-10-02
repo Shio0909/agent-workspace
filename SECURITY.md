@@ -17,6 +17,10 @@ hardened for multi-tenant or untrusted-code workloads.
   built in.
 - State is stored in a local bbolt database with a process lock. It is not a
   multi-controller database.
+- Credentials written through the API are stored in Kubernetes Secrets, so
+  their at-rest protection is whatever the cluster provides (base64 by default).
+  The controller itself keeps only version numbers and key names. Any holder of
+  the shared control token can write any workspace's credentials.
 - TLS termination and rate limiting are expected to be provided by the
   surrounding deployment.
 

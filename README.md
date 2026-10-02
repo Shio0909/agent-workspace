@@ -17,6 +17,7 @@ It manages one Deployment, Service, and PersistentVolumeClaim per workspace. Wor
 - Bounded reconciliation concurrency and per-workspace serialization.
 - Readiness-aware HTTP and SSE/WebSocket forwarding.
 - Audit trail, cold-start histograms, and Prometheus-compatible metrics.
+- Per-workspace credential injection and rotation: the LLM key lives in a Kubernetes Secret mounted as files, so an agent picks up a new key without a pod restart. See [docs/agent-credentials.md](docs/agent-credentials.md).
 
 ## Architecture
 
@@ -83,10 +84,17 @@ The controller exposes a small HTTP API.
 | `POST` | `/v1/workspaces/{id}/stop` | Stop a workspace while keeping storage |
 | `POST` | `/v1/workspaces/{id}/restart` | Restart the workload |
 | `DELETE` | `/v1/workspaces/{id}` | Delete the workload and storage |
+| `PUT` | `/v1/workspaces/{id}/credentials` | Replace the workspace's credentials (returns version and key names only) |
+| `GET` | `/v1/workspaces/{id}/credentials` | Credential metadata, never values |
+| `DELETE` | `/v1/workspaces/{id}/credentials` | Remove the workspace's credentials |
 | `GET` | `/v1/audit` | Query lifecycle audit records |
 | `ANY` | `/w/{id}/*` | Forward HTTP, SSE, and WebSocket traffic |
 
 Lifecycle writes require `X-Biz-Id` for idempotency. All control-plane endpoints require `X-Control-Token`.
+
+## Agent workload
+
+`cmd/agent-runtime` is a small ReAct agent that runs in a workspace: it reads its LLM key from the mounted credential directory, keeps conversations on the workspace volume, and confines its file tools to one directory. `cmd/fake-llm` is a deterministic OpenAI-compatible endpoint for demos and tests. The `agent` profile in `configs/profiles.json` wires them together; `scripts/kind-credentials.sh` runs the rotation scenario end to end.
 
 ## Development
 

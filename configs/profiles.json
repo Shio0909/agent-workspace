@@ -7,5 +7,21 @@
     "storage": "1Gi",
     "cpu": "1",
     "memory": "256Mi"
+  },
+  "agent": {
+    "image": "agent-workspace-agent:local",
+    "port": 8080,
+    "health_path": "/health",
+    "mount_path": "/workspace",
+    "storage": "1Gi",
+    "cpu": "1",
+    "memory": "256Mi",
+    "credential_path": "/var/run/agent-credentials",
+    "env": {
+      "WORKSPACE_DIR": "/workspace",
+      "CREDENTIAL_DIR": "/var/run/agent-credentials",
+      "LLM_BASE_URL": "http://fake-llm.agent-workspace.svc.cluster.local:8081/v1",
+      "LLM_MODEL": "demo"
+    }
   }
 }

@@ -368,6 +368,11 @@ func (r *Runtime) Delete(ctx context.Context, w control.Workspace) error {
 	if err := client.CoreV1().PersistentVolumeClaims(r.Namespace).Delete(ctx, name(w), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
+	// Credentials go last and only here: Stop and Restart keep them, like the
+	// PVC, so a resumed workspace still has its keys.
+	if err := client.CoreV1().Secrets(r.Namespace).Delete(ctx, credentialSecretName(w), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
 	return nil
 }
 
@@ -405,6 +410,13 @@ func (r *Runtime) checkOwnership(ctx context.Context, w control.Workspace) error
 	if p, err := client.CoreV1().PersistentVolumeClaims(r.Namespace).Get(ctx, name(w), metav1.GetOptions{}); err == nil {
 		if !owns(p.Labels, w) {
 			return fmt.Errorf("refusing unmanaged pvc %s", name(w))
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	if sec, err := client.CoreV1().Secrets(r.Namespace).Get(ctx, credentialSecretName(w), metav1.GetOptions{}); err == nil {
+		if !owns(sec.Labels, w) {
+			return fmt.Errorf("refusing unmanaged secret %s", credentialSecretName(w))
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return err
@@ -455,6 +467,10 @@ func BuildObjects(w control.Workspace, p control.Profile, namespace string) (*co
 			Name:         "config",
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: p.ConfigSecret}},
 		})
+	}
+	if p.CredentialPath != "" {
+		mounts = append(mounts, corev1.VolumeMount{Name: "credentials", MountPath: p.CredentialPath, ReadOnly: true})
+		volumes = append(volumes, credentialVolume(w))
 	}
 	container := corev1.Container{
 		Name:            "agent",
