@@ -59,6 +59,26 @@ coarse even though the total uses the controller's own clock.
 - Grace expiry: exactly one hard delete.
 - Stop and restart paths never delete the PVC.
 
+## Failure and load scenarios
+
+`scripts/kind-stress.sh` checks invariants rather than speed, and exits non-zero
+when one does not hold:
+
+- Rotating credentials on many busy workspaces while the provider accepts old
+  and new keys: no request fails and no pod restarts.
+- `kill -9` of the agent process under load: every answered turn is still on the
+  volume, and a turn that was in flight is not half-saved.
+- `kill -9` of the controller under load: workloads are not replaced, the
+  workspace list is unchanged, and traffic returns when the controller does.
+- `restart_on_credential_change`: a rotation replaces the pod and the
+  conversation survives on the volume.
+- Optionally the same rotation against a real OpenAI-compatible provider
+  (`REAL_LLM_URL`, `REAL_LLM_MODEL`, `REAL_LLM_KEY_FILE`).
+
+`scripts/kind-lifecycle.sh` does the same for upgrade, automatic rollback and
+heartbeat recovery. Both run on a local kind cluster with a fake LLM unless
+stated otherwise, so they say nothing about a production cluster.
+
 ## Method notes
 
 - Benchmarks exercise the storage and HTTP control path, not model inference.

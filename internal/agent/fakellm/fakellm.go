@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Server struct {
@@ -69,6 +71,8 @@ type chatMessage struct {
 // complete answers deterministically:
 //   - "write <path>: <text>" asks for a write_file tool call;
 //   - after the tool result it answers "saved";
+//   - "sleep <ms> <text>" waits that long (at most 60s) before answering like
+//     "<text>", which gives tests a turn that is reliably still in flight;
 //   - anything else echoes the text with the number of user turns seen, which
 //     shows that the agent replayed its persisted conversation.
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +99,9 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	last := in.Messages[len(in.Messages)-1]
+	if last.Role == "user" {
+		last.Content = s.pause(r, last.Content)
+	}
 	reply := map[string]any{"role": "assistant"}
 	switch {
 	case last.Role == "tool":
@@ -118,4 +125,25 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": reply}}})
+}
+
+// pause implements the "sleep <ms> <text>" prefix and returns the text to
+// answer. It gives up early if the client goes away.
+func (s *Server) pause(r *http.Request, content string) string {
+	rest, ok := strings.CutPrefix(content, "sleep ")
+	if !ok {
+		return content
+	}
+	num, text, _ := strings.Cut(rest, " ")
+	ms, err := strconv.Atoi(num)
+	if err != nil || ms < 0 {
+		return content
+	}
+	timer := time.NewTimer(time.Duration(min(ms, 60000)) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-r.Context().Done():
+	}
+	return text
 }
