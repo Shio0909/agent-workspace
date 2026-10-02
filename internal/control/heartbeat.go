@@ -11,14 +11,17 @@ import (
 	"time"
 )
 
-// heartbeatReport is what a workload returns from its heartbeat path. Both
-// fields are optional: an empty 200 still proves the process is answering.
+// heartbeatReport is what a workload returns from its heartbeat path. Every
+// field is optional: an empty 200 still proves the process is answering.
 type heartbeatReport struct {
 	// Busy means work is in flight that no client request is holding open, such
 	// as an agent finishing a task. It counts as activity, so the idle reaper
 	// does not stop a workspace in the middle of it.
 	Busy    bool   `json:"busy"`
 	Version string `json:"version"`
+	// Usage stays raw so that a malformed usage object cannot take busy and
+	// version down with it; see parseUsage.
+	Usage json.RawMessage `json:"usage"`
 }
 
 // Beat polls the workload of a running workspace. The scheduler calls it after
@@ -136,11 +139,26 @@ func (c *Controller) beatOK(s *slot, w *Workspace, r heartbeatReport, now time.T
 	if now.Sub(w.HeartbeatAt) >= c.ActivityFlushInterval {
 		w.HeartbeatAt, changed = now, true
 	}
+	mergeUsage(s, w)
+	if c.observeUsage(s, w, r.Usage, now) {
+		changed = true
+	}
+	if w.overBudget() && w.Desired == DesiredRunning {
+		// Checked on every beat rather than only when the usage moved, so a
+		// failed write is retried by the next beat instead of being forgotten.
+		w.UpdatedAt = now
+		if err := c.suspendOverBudget(s, w, now); err != nil {
+			slog.Warn("persist budget suspension", "workspace", w.ID, "error", err)
+		}
+		return
+	}
 	if changed {
 		w.UpdatedAt = now
 		if err := c.store.Put(*w); err != nil {
 			slog.Warn("persist heartbeat", "workspace", w.ID, "error", err)
+			return
 		}
+		s.usageFlushedAt = now
 	}
 }
 

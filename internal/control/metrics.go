@@ -40,6 +40,66 @@ type Metrics struct {
 	StartPull     Histogram
 	StartReady    Histogram
 	StartTotal    Histogram
+
+	// 这两个计数器按 profile 分组而不是按工作区：工作区 ID 的数量没有上限，
+	// 作为标签会把时序数撑爆，而 profile 由配置文件限定。
+	usageMu        sync.Mutex
+	tokens         map[tokenSeries]int64
+	budgetSuspends map[string]int64
+}
+
+type tokenSeries struct{ profile, kind string }
+
+// addTokens attributes the positive increments a heartbeat revealed.
+func (m *Metrics) addTokens(profile string, prompt, completion int64) {
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	if m.tokens == nil {
+		m.tokens = map[tokenSeries]int64{}
+	}
+	if prompt > 0 {
+		m.tokens[tokenSeries{profile, "prompt"}] += prompt
+	}
+	if completion > 0 {
+		m.tokens[tokenSeries{profile, "completion"}] += completion
+	}
+}
+
+func (m *Metrics) addBudgetSuspension(profile string) {
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	if m.budgetSuspends == nil {
+		m.budgetSuspends = map[string]int64{}
+	}
+	m.budgetSuspends[profile]++
+}
+
+func (m *Metrics) writeUsage(b *bytes.Buffer) {
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	series := make([]tokenSeries, 0, len(m.tokens))
+	for k := range m.tokens {
+		series = append(series, k)
+	}
+	sort.Slice(series, func(i, j int) bool {
+		if series[i].profile != series[j].profile {
+			return series[i].profile < series[j].profile
+		}
+		return series[i].kind < series[j].kind
+	})
+	fmt.Fprint(b, "# HELP nc_tokens_total LLM tokens reported by workloads through the heartbeat, by profile and kind.\n# TYPE nc_tokens_total counter\n")
+	for _, k := range series {
+		fmt.Fprintf(b, "nc_tokens_total{profile=%q,kind=%q} %d\n", k.profile, k.kind, m.tokens[k])
+	}
+	profiles := make([]string, 0, len(m.budgetSuspends))
+	for p := range m.budgetSuspends {
+		profiles = append(profiles, p)
+	}
+	sort.Strings(profiles)
+	fmt.Fprint(b, "# HELP nc_budget_suspensions_total Workspaces suspended because they used up their token budget, by profile.\n# TYPE nc_budget_suspensions_total counter\n")
+	for _, p := range profiles {
+		fmt.Fprintf(b, "nc_budget_suspensions_total{profile=%q} %d\n", p, m.budgetSuspends[p])
+	}
 }
 
 // histogramBuckets 覆盖从热路径（毫秒）到镜像拉取（分钟）的范围。
@@ -201,6 +261,7 @@ func (c *Controller) WriteMetrics(out io.Writer) error {
 	writeValue(&b, "nc_audit_failures_total", "Audit events which could not be persisted.", "counter", m.AuditFailures.Load())
 	writeValue(&b, "nc_event_reconciles_total", "Reconciles triggered by runtime events or intent changes.", "counter", m.EventReconciles.Load())
 	writeValue(&b, "nc_event_reconcile_failures_total", "Event-driven reconciles which failed and were requeued with backoff.", "counter", m.EventReconcileErrors.Load())
+	m.writeUsage(&b)
 	m.AcquireWait.writeTo(&b, "nc_workspace_acquire_seconds", "Time a request waited for a ready endpoint, including cold starts.", "", "")
 	const startMetric = "nc_workspace_start_seconds"
 	fmt.Fprintf(&b, "# HELP %s Cold-start duration by phase, from pod condition timestamps.\n# TYPE %s histogram\n", startMetric, startMetric)

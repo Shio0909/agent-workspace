@@ -17,6 +17,9 @@ var (
 	// ErrExpired 表示租期已过。挂起态只能靠续期恢复（PVC 还在，但工作负载
 	// 已经缩容到 0），所以调用方必须先续期再唤醒，见 SetExpiry。
 	ErrExpired = errors.New("workspace expired")
+	// ErrBudgetExceeded 表示工作区因 token 预算用尽被挂起。和 ErrExpired 分开：
+	// 恢复手段不同（调高预算，而不是续期），HTTP 状态码也不同。
+	ErrBudgetExceeded = errors.New("workspace token budget exceeded")
 
 	// 幂等记录的状态机是 processing -> success | failed。两个终态都不可逆：
 	// 重复提交只会拿到第一次的结果，不会产生第二次副作用。调用方要重试就
@@ -63,6 +66,8 @@ const (
 	OpStop    = "stop"
 	OpRestart = "restart"
 	OpDelete  = "delete"
+	// OpTokenBudget 只在调用方带了 X-Biz-Id 时才会用到。
+	OpTokenBudget = "token-budget"
 )
 
 // 审计动作。前 11 个覆盖完整的生命周期与租约路径，后 3 个是续期相关动作：
@@ -92,6 +97,12 @@ const (
 	ActionHeartbeatLost    = "heartbeat-lost"
 	ActionHeartbeatRestart = "heartbeat-restart"
 	ActionHeartbeatBack    = "heartbeat-recovered"
+	// 用量与预算动作。budget-exceeded 是控制面自己的挂起决策，记录在
+	// 触发它的那一刻；usage-regressed 表示工作负载报告了比已记录值更小的
+	// 累计用量。
+	ActionBudgetSet      = "token-budget-set"
+	ActionBudgetExceeded = "budget-exceeded"
+	ActionUsageRegressed = "usage-regressed"
 )
 
 const (
@@ -217,7 +228,20 @@ type Workspace struct {
 	// lost heartbeats; it rate-limits further automatic restarts.
 	AutoRestartAt time.Time `json:"auto_restart_at,omitempty"`
 	AgentVersion  string    `json:"agent_version,omitempty"`
+
+	// TokenBudget 是 Usage.TotalTokens 的上限，0 表示不限。它是终身累计量的
+	// 上限，不按周期重置：续期的方式是调高它。
+	TokenBudget int64 `json:"token_budget,omitempty"`
+	// Usage 是工作负载经心跳报告的累计 LLM 用量，单调不减。从未上报的工作
+	// 负载保持零值，序列化时省略。
+	Usage Usage `json:"usage,omitzero"`
+	// SuspendedFor 说明 Desired=suspended 的原因。空表示租期到期，这是它
+	// 出现之前唯一的原因；预算挂起的工作区不会被宽限期硬删，见 applyExpiry。
+	SuspendedFor string `json:"suspended_for,omitempty"`
 }
+
+// SuspendedForBudget 是 Workspace.SuspendedFor 的取值。
+const SuspendedForBudget = "token_budget"
 
 // DeletionReason 的取值。
 const (
@@ -228,6 +252,19 @@ const (
 // expired 判断租期是否已过。零值 ExpiresAt 表示永不过期。
 func (w Workspace) expired(now time.Time) bool {
 	return !w.ExpiresAt.IsZero() && !now.Before(w.ExpiresAt)
+}
+
+// blocked 判断工作区能否被唤醒（start、restart、租约、网关请求）。挂起的
+// 工作区拒绝一切非删除操作；wake 为 true 时，已过期但还没被挂起的也拒绝，
+// 否则一次请求就能让过期的工作区复活。
+func (w Workspace) blocked(now time.Time, wake bool) error {
+	switch {
+	case w.Desired == DesiredSuspended && w.SuspendedFor == SuspendedForBudget:
+		return ErrBudgetExceeded
+	case w.Desired == DesiredSuspended || (wake && w.expired(now)):
+		return ErrExpired
+	}
+	return nil
 }
 
 // Operation 是一条跨请求的幂等记录。BizID 由调用方提供，是唯一的幂等键；
@@ -322,7 +359,7 @@ func validDesired(desired string) bool {
 
 func validOpType(opType string) bool {
 	switch opType {
-	case OpStart, OpStop, OpRestart, OpDelete:
+	case OpStart, OpStop, OpRestart, OpDelete, OpTokenBudget:
 		return true
 	}
 	return false

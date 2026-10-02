@@ -205,6 +205,9 @@ func (s *Server) Handler() http.Handler {
 		}
 		respond(w, http.StatusOK, item)
 	})
+	// 预算是绝对值写入，重复提交结果相同，所以和续期一样不强制幂等键；调用方
+	// 带了 X-Biz-Id 就按幂等键去重，重放拿到第一次的记录。
+	mux.HandleFunc("PUT /v1/workspaces/{id}/token-budget", s.tokenBudget)
 	// 凭据接口：PUT 整体替换，GET 只返回元数据，任何响应都不含值。PUT 不要求
 	// 幂等键：重复提交只会多升一个版本号，内容不变。
 	mux.HandleFunc("PUT /v1/workspaces/{id}/credentials", func(w http.ResponseWriter, r *http.Request) {
@@ -373,6 +376,39 @@ func (s *Server) actor(r *http.Request) string {
 	return actor
 }
 
+func (s *Server) tokenBudget(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		TokenBudget *int64 `json:"token_budget"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	// 必须显式给出：缺字段不能悄悄变成 0，也就是"不限"。
+	if in.TokenBudget == nil {
+		fail(w, control.ErrInvalid)
+		return
+	}
+	id := r.PathValue("id")
+	bizID := r.Header.Get("X-Biz-Id")
+	if bizID != "" {
+		op, err := s.Controller.BeginOperation(bizID, id, control.OpTokenBudget)
+		if replay(w, op, err) {
+			return
+		}
+	}
+	item, err := s.Controller.SetTokenBudget(s.actor(r), id, *in.TokenBudget)
+	if bizID != "" {
+		if finishErr := s.Controller.FinishOperation(bizID, err); finishErr != nil {
+			slog.Error("finish operation", "biz_id", bizID, "workspace", id, "error", finishErr)
+		}
+	}
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	respond(w, http.StatusOK, item)
+}
+
 func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		TTL int `json:"ttl_seconds"`
@@ -516,6 +552,8 @@ func fail(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, control.ErrExpired):
 		status = http.StatusGone
+	case errors.Is(err, control.ErrBudgetExceeded):
+		status = http.StatusPaymentRequired
 	case errors.Is(err, context.DeadlineExceeded):
 		status = http.StatusGatewayTimeout
 	case errors.Is(err, context.Canceled):

@@ -72,6 +72,7 @@ type Agent struct {
 	cfg      Config
 	sessions sync.Map // session id -> *sync.Mutex
 	inflight atomic.Int64
+	usage    *usageMeter
 }
 
 func New(cfg Config) *Agent {
@@ -91,7 +92,7 @@ func New(cfg Config) *Agent {
 		cfg.HTTPClient = &http.Client{Timeout: cfg.LLMTimeout}
 	}
 	cfg = cfg.withCompactionDefaults()
-	return &Agent{cfg: cfg}
+	return &Agent{cfg: cfg, usage: loadUsage(usagePath(cfg.WorkspaceDir))}
 }
 
 type message struct {
@@ -160,9 +161,10 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("GET /status", a.status)
 	// The controller polls this. busy means a chat is being worked on, which
 	// the controller treats as activity so the idle reaper cannot stop the
-	// workspace between a request and its answer.
+	// workspace between a request and its answer. usage is the cumulative token
+	// count, which the controller compares against the workspace's budget.
 	mux.HandleFunc("GET /heartbeat", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"busy": a.inflight.Load() > 0, "version": a.cfg.Version})
+		writeJSON(w, http.StatusOK, map[string]any{"busy": a.inflight.Load() > 0, "version": a.cfg.Version, "usage": a.usage.snapshot()})
 	})
 	mux.HandleFunc("POST /v1/chat", a.chat)
 	return mux
@@ -177,6 +179,7 @@ func (a *Agent) status(w http.ResponseWriter, r *http.Request) {
 		"credential_version": cred.Version,
 		"has_credential":     err == nil,
 		"sessions":           len(entries),
+		"usage":              a.usage.snapshot(),
 		"pid":                os.Getpid(),
 	})
 }
@@ -333,8 +336,14 @@ func (a *Agent) completeOnce(ctx context.Context, apiKey string, body []byte) (m
 			Message      message `json:"message"`
 			FinishReason string  `json:"finish_reason"`
 		} `json:"choices"`
+		Usage *Usage `json:"usage"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil || len(out.Choices) == 0 {
+	err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out)
+	if err == nil && out.Usage != nil {
+		// Counted before the reply is judged: the provider billed it either way.
+		a.usage.add(*out.Usage)
+	}
+	if err != nil || len(out.Choices) == 0 {
 		return message{}, true, errors.New("llm returned an unreadable response")
 	}
 	m := out.Choices[0].Message
