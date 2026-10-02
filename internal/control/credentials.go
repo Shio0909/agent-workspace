@@ -116,6 +116,7 @@ func (c *Controller) SetCredentials(actor, id string, values map[string]string) 
 		return CredentialInfo{}, err
 	}
 	c.audit(actor, ActionCredentialSet, id, fmt.Sprintf("version=%d keys=%s", version, strings.Join(keys, ",")), ResultOK)
+	c.restartForCredentials(actor, id, s)
 	return credentialInfo(w), nil
 }
 
@@ -149,6 +150,7 @@ func (c *Controller) ClearCredentials(actor, id string) (CredentialInfo, error) 
 		return CredentialInfo{}, err
 	}
 	c.audit(actor, ActionCredentialClear, id, fmt.Sprintf("version=%d", w.CredentialVersion), ResultOK)
+	c.restartForCredentials(actor, id, s)
 	return credentialInfo(w), nil
 }
 
@@ -159,4 +161,23 @@ func (c *Controller) Credentials(id string) (CredentialInfo, error) {
 		return CredentialInfo{}, err
 	}
 	return credentialInfo(w), nil
+}
+
+// restartForCredentials asks for a workload replacement when the profile
+// cannot reload credentials by itself. The caller holds the slot lock. A
+// failure here is not a failure of the credential change, which is already
+// durable: the error is audited and the next restart or start picks the key up.
+func (c *Controller) restartForCredentials(actor, id string, s *slot) {
+	w, err := c.store.Get(id)
+	if err != nil || w.Desired != DesiredRunning || !c.profiles[w.Profile].RestartOnCredentialChange {
+		return
+	}
+	w.RestartPending, w.UpdatedAt = true, c.now()
+	if err := c.store.Put(w); err != nil {
+		c.audit(actor, ActionRestart, id, "restart after credential change not recorded", ResultError)
+		return
+	}
+	s.resetReady()
+	c.queue.Add(id)
+	c.audit(actor, ActionRestart, id, "workload replaced to load the new credentials", ResultOK)
 }

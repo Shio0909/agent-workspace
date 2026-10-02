@@ -223,3 +223,63 @@ func TestProfileValidationCredentialPath(t *testing.T) {
 		}
 	}
 }
+
+func TestRestartOnCredentialChangeReplacesRunningWorkload(t *testing.T) {
+	c, r := credFixture(t, Profile{CredentialPath: "/run/creds", RestartOnCredentialChange: true})
+	ctx := context.Background()
+	if _, err := c.SetDesired(testActor, "a1", DesiredRunning); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Reconcile(ctx, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, restarts := r.counts(); restarts != 0 {
+		t.Fatalf("restart before any credential change: %d", restarts)
+	}
+	if _, err := c.SetCredentials(testActor, "a1", map[string]string{"llm_api_key": "k2"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Reconcile(ctx, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, restarts := r.counts(); restarts != 1 {
+		t.Fatalf("rotation did not replace the workload: restarts=%d", restarts)
+	}
+	if _, err := c.ClearCredentials(testActor, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Reconcile(ctx, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, restarts := r.counts(); restarts != 2 {
+		t.Fatalf("clear did not replace the workload: restarts=%d", restarts)
+	}
+}
+
+func TestRotationDoesNotRestartWithoutOptInOrWhenNotRunning(t *testing.T) {
+	ctx := context.Background()
+	c, r := credFixture(t, Profile{CredentialPath: "/run/creds"})
+	if _, err := c.SetDesired(testActor, "a1", DesiredRunning); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SetCredentials(testActor, "a1", map[string]string{"llm_api_key": "k"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Reconcile(ctx, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, restarts := r.counts(); restarts != 0 {
+		t.Fatalf("profile without opt-in was restarted: %d", restarts)
+	}
+
+	c, r = credFixture(t, Profile{CredentialPath: "/run/creds", RestartOnCredentialChange: true})
+	if _, err := c.SetCredentials(testActor, "a1", map[string]string{"llm_api_key": "k"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Reconcile(ctx, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, restarts := r.counts(); restarts != 0 {
+		t.Fatalf("a stopped workspace was restarted: %d", restarts)
+	}
+}
