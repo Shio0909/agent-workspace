@@ -16,6 +16,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "services", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # Per-workspace credential Secrets are fetched, written and deleted by name.
+  # There is deliberately no list or watch: the controller cannot enumerate
+  # other Secrets in the namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

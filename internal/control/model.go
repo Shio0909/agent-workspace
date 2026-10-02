@@ -77,6 +77,9 @@ const (
 	ActionHardDelete   = "hard-delete"
 	ActionResume       = "resume"
 	ActionExpirySet    = "expiry-set"
+	// 凭据动作只记录版本号和键名，永远不记录值。
+	ActionCredentialSet   = "credential-set"
+	ActionCredentialClear = "credential-clear"
 )
 
 const (
@@ -101,6 +104,10 @@ type Profile struct {
 	EnvSecret    string            `json:"env_secret,omitempty"`
 	ConfigSecret string            `json:"config_secret,omitempty"`
 	ConfigPath   string            `json:"config_path,omitempty"`
+	// CredentialPath 是每个工作区自己的凭据 Secret 的挂载目录。非空才允许
+	// 通过 API 注入凭据。它以文件而不是环境变量交付：文件会随 Secret 更新，
+	// 环境变量只能靠重启 Pod 才能换新。
+	CredentialPath string `json:"credential_path,omitempty"`
 }
 
 func (p Profile) Validate() error {
@@ -112,6 +119,14 @@ func (p Profile) Validate() error {
 	}
 	if p.ConfigSecret != "" && (len(p.ConfigPath) < 2 || p.ConfigPath[0] != '/') {
 		return fmt.Errorf("%w: config_secret needs an absolute config_path", ErrInvalid)
+	}
+	if p.CredentialPath != "" {
+		if len(p.CredentialPath) < 2 || p.CredentialPath[0] != '/' {
+			return fmt.Errorf("%w: credential_path must be absolute", ErrInvalid)
+		}
+		if p.CredentialPath == p.MountPath || p.CredentialPath == p.ConfigPath {
+			return fmt.Errorf("%w: credential_path must not overlap mount_path or config_path", ErrInvalid)
+		}
 	}
 	return nil
 }
@@ -137,6 +152,12 @@ type Workspace struct {
 	// DeletionReason 记录这次删除由谁发起。它不影响行为，只影响审计措辞，
 	// 但删除失败重试几轮之后仍然要能说清楚"是谁要删的"。
 	DeletionReason string `json:"deletion_reason,omitempty"`
+	// CredentialVersion 每次写入凭据加一，0 表示从未写入。凭据的值只存在于
+	// Kubernetes Secret 里：这里和审计日志都只保存版本号与键名，所以控制器
+	// 的状态库泄露不会泄露 agent 的密钥。
+	CredentialVersion   int       `json:"credential_version,omitempty"`
+	CredentialKeys      []string  `json:"credential_keys,omitempty"`
+	CredentialUpdatedAt time.Time `json:"credential_updated_at,omitempty"`
 }
 
 // DeletionReason 的取值。
@@ -199,6 +220,14 @@ type StartupObserver interface {
 // /metrics 输出里。
 type MetricsExporter interface {
 	WriteMetrics(io.Writer) error
+}
+
+// CredentialStore 是 Runtime 的可选能力：为单个工作区保管一组凭据。
+// version 随凭据一起写入，让工作区内的 agent 能报告自己加载的是哪一版。
+// ClearCredentials 对不存在的凭据不报错。Stop 必须保留凭据，Delete 才会删除。
+type CredentialStore interface {
+	SetCredentials(ctx context.Context, w Workspace, version int, values map[string]string) error
+	ClearCredentials(ctx context.Context, w Workspace) error
 }
 
 // Runtime owns compute and workspace storage. Stop must preserve storage;

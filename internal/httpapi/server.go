@@ -26,6 +26,9 @@ const readinessTimeout = 5 * time.Second
 // 能把整个文件读进内存。
 const maxAuditLimit = 1000
 
+// maxCredentialBody 略大于凭据总量上限（64 KiB），给 JSON 转义和键名留余量。
+const maxCredentialBody = 96 << 10
+
 // maxActorLength 截断调用方自报的归属名，避免单条请求把审计日志撑大。
 const maxActorLength = 128
 
@@ -169,6 +172,38 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		respond(w, http.StatusOK, item)
+	})
+	// 凭据接口：PUT 整体替换，GET 只返回元数据，任何响应都不含值。PUT 不要求
+	// 幂等键：重复提交只会多升一个版本号，内容不变。
+	mux.HandleFunc("PUT /v1/workspaces/{id}/credentials", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Values map[string]string `json:"values"`
+		}
+		if !decodeLimited(w, r, &in, false, maxCredentialBody) {
+			return
+		}
+		info, err := s.Controller.SetCredentials(s.actor(r), r.PathValue("id"), in.Values)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		respond(w, http.StatusOK, info)
+	})
+	mux.HandleFunc("GET /v1/workspaces/{id}/credentials", func(w http.ResponseWriter, r *http.Request) {
+		info, err := s.Controller.Credentials(r.PathValue("id"))
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		respond(w, http.StatusOK, info)
+	})
+	mux.HandleFunc("DELETE /v1/workspaces/{id}/credentials", func(w http.ResponseWriter, r *http.Request) {
+		info, err := s.Controller.ClearCredentials(s.actor(r), r.PathValue("id"))
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		respond(w, http.StatusOK, info)
 	})
 	mux.HandleFunc("POST /v1/workspaces/{id}/leases", s.lease)
 	mux.HandleFunc("PUT /v1/workspaces/{id}/leases/{lease}", s.lease)
@@ -373,7 +408,11 @@ func decodeOptional(w http.ResponseWriter, r *http.Request, dst any) bool {
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty bool) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
+	return decodeLimited(w, r, dst, allowEmpty, 8192)
+}
+
+func decodeLimited(w http.ResponseWriter, r *http.Request, dst any, allowEmpty bool, limit int64) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		if allowEmpty && errors.Is(err, io.EOF) {
