@@ -26,6 +26,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("LLM_TIMEOUT: %v", err)
 	}
+	// Compaction is off until the model's context window is given.
+	window, _ := strconv.Atoi(env("AGENT_CONTEXT_TOKENS", "0"))
+	reserve, _ := strconv.Atoi(env("AGENT_RESERVE_TOKENS", "0"))
+	keep, _ := strconv.Atoi(env("AGENT_KEEP_RECENT_TOKENS", "0"))
 	a := agent.New(agent.Config{
 		WorkspaceID:   os.Getenv("WORKSPACE_ID"),
 		Version:       os.Getenv("AGENT_VERSION"),
@@ -36,6 +40,10 @@ func main() {
 		MaxSteps:      steps,
 		LLMTimeout:    timeout,
 		LLMRetries:    retries,
+
+		ContextTokens:    window,
+		ReserveTokens:    reserve,
+		KeepRecentTokens: keep,
 	})
 	server := &http.Server{Addr: env("LISTEN_ADDR", ":8080"), Handler: a.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	log.Fatal(server.ListenAndServe())

@@ -20,6 +20,7 @@ type env struct {
 	handle http.Handler
 	work   string
 	creds  string
+	mod    func(*Config) // applied on every restart, for tests that need a non-default Config
 }
 
 func newEnv(t *testing.T, keys ...string) *env {
@@ -35,7 +36,11 @@ func newEnv(t *testing.T, keys ...string) *env {
 // restart builds a fresh Agent on the same directories, which is what a pod
 // restart looks like: only the volumes survive.
 func (e *env) restart(llmURL string) {
-	e.agent = New(Config{WorkspaceID: "a1", WorkspaceDir: e.work, CredentialDir: e.creds, LLMBaseURL: llmURL, Model: "m"})
+	cfg := Config{WorkspaceID: "a1", WorkspaceDir: e.work, CredentialDir: e.creds, LLMBaseURL: llmURL, Model: "m"}
+	if e.mod != nil {
+		e.mod(&cfg)
+	}
+	e.agent = New(cfg)
 	e.handle = e.agent.Handler()
 }
 

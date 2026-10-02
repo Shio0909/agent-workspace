@@ -4,6 +4,10 @@ A small Kubernetes controller for agent workspace lifecycle.
 
 It manages one Deployment, Service, and PersistentVolumeClaim per workspace. Workspaces can be started on demand, stopped when idle, resumed with their storage intact, and reclaimed in explicit stages.
 
+## Where it fits
+
+This project decides when a workspace runs, sleeps, and is reclaimed, forwards traffic to it, and handles what an agent needs while it lives: credentials, upgrades, health. It does not isolate untrusted code. If that is the requirement, use a sandbox runtime, for example through [Agent Sandbox](https://agent-sandbox.sigs.k8s.io/docs/) (`kubernetes-sigs/agent-sandbox`), which is built for that and also offers warm pools and a Kubernetes-native API. [docs/comparison.md](docs/comparison.md) sets the two side by side and says what each does not do.
+
 ## Features
 
 - Per-workspace lifecycle: create, start, stop, restart, and delete.
@@ -97,7 +101,7 @@ Lifecycle writes require `X-Biz-Id` for idempotency. All control-plane endpoints
 
 ## Agent workload
 
-`cmd/agent-runtime` is a small ReAct agent that runs in a workspace: it reads its LLM key from the mounted credential directory, keeps conversations on the workspace volume, and confines its file tools to one directory. `cmd/fake-llm` is a deterministic OpenAI-compatible endpoint for demos and tests. The `agent` profile in `configs/profiles.json` wires them together; `scripts/kind-credentials.sh` runs the rotation scenario end to end and `scripts/kind-lifecycle.sh` the upgrade, rollback and heartbeat scenarios. `cmd/agent-eval` and `scripts/llm-trial.sh` run repeated trials against any OpenAI-compatible endpoint.
+`cmd/agent-runtime` is a small ReAct agent that runs in a workspace: it reads its LLM key from the mounted credential directory, keeps conversations on the workspace volume, and confines its file tools to one directory. Set `AGENT_CONTEXT_TOKENS` to the model's context window and a session that outgrows it is compacted: older turns become a summary, recent turns stay verbatim, and a failed summary falls back to a raw archive (`AGENT_RESERVE_TOKENS` and `AGENT_KEEP_RECENT_TOKENS` tune the budgets; see `internal/agent/compact.go`). `cmd/fake-llm` is a deterministic OpenAI-compatible endpoint for demos and tests. The `agent` profile in `configs/profiles.json` wires them together; `scripts/kind-credentials.sh` runs the rotation scenario end to end and `scripts/kind-lifecycle.sh` the upgrade, rollback and heartbeat scenarios. `cmd/agent-eval` and `scripts/llm-trial.sh` run repeated trials against any OpenAI-compatible endpoint.
 
 ## Development
 
