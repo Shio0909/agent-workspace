@@ -33,6 +33,7 @@ type config struct {
 	listen       string
 	data         string
 	profiles     string
+	tokens       string
 	namespace    string
 	kubeContext  string
 	token        string
@@ -66,6 +67,10 @@ func run() error {
 		return err
 	}
 	profiles, err := loadProfiles(cfg.profiles)
+	if err != nil {
+		return err
+	}
+	scopedTokens, err := loadScopedTokens(cfg.tokens, cfg.token, profiles)
 	if err != nil {
 		return err
 	}
@@ -104,7 +109,7 @@ func run() error {
 	// 事件驱动对账：工作区一变就对账，并唤醒正在等待它的请求。没有运行时
 	// 事件源时它仍然立即执行意图变更（start/stop/delete 不再等下一轮扫描）。
 	go c.StartEvents(ctx)
-	api := &httpapi.Server{Controller: c, Token: cfg.token, Actor: "api"}
+	api := &httpapi.Server{Controller: c, Token: cfg.token, Tokens: scopedTokens, Actor: "api"}
 	server := &http.Server{Addr: cfg.listen, Handler: api.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- server.ListenAndServe() }()
@@ -142,6 +147,7 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.StringVar(&cfg.listen, "listen", "127.0.0.1:8090", "HTTP listen address")
 	fs.StringVar(&cfg.data, "data", "data", "exclusive controller data directory")
 	fs.StringVar(&cfg.profiles, "profiles", "configs/profiles.json", "runtime profile file")
+	fs.StringVar(&cfg.tokens, "tokens", "", "optional scoped control token file (SHA-256 digests); empty means only the shared token")
 	fs.StringVar(&cfg.namespace, "namespace", "agent-workspace", "dedicated Kubernetes namespace")
 	fs.StringVar(&cfg.kubeContext, "context", "", "kubeconfig context; empty uses in-cluster/current context")
 	fs.DurationVar(&cfg.idle, "idle", 15*time.Minute, "idle timeout and controller restart grace")
@@ -207,6 +213,27 @@ func (c config) validate() error {
 		return errors.New("-activity-flush must be in [0, -idle)")
 	}
 	return nil
+}
+
+// loadScopedTokens 在没有配置文件时返回空。条目与共享令牌相同会被拒绝：
+// 共享令牌先匹配，那条限制永远不会生效，却会让人以为令牌被限制住了。
+func loadScopedTokens(path, shared string, profiles map[string]control.Profile) ([]httpapi.ScopedToken, error) {
+	if path == "" {
+		return nil, nil
+	}
+	tokens, err := httpapi.LoadScopedTokens(path, profiles)
+	if err != nil {
+		return nil, fmt.Errorf("-tokens: %w", err)
+	}
+	if name, same := httpapi.ShadowsToken(tokens, shared); same {
+		return nil, fmt.Errorf("-tokens: token %s is the shared token, so its restrictions would never apply", name)
+	}
+	names := make([]string, len(tokens))
+	for i, t := range tokens {
+		names[i] = t.Name
+	}
+	slog.Info("scoped control tokens loaded", "count", len(tokens), "names", names)
+	return tokens, nil
 }
 
 // loadProfiles 拒绝未知字段：profile 决定镜像、挂载和资源，一个拼错的键

@@ -75,5 +75,5 @@ kubelet 刷新挂载的 Secret 文件靠它自己的同步周期，不是即时�
 ## 已知边界
 
 - 升级、回滚和心跳见 [upgrade-and-heartbeat.md](upgrade-and-heartbeat.md)。按 agent 版本做兼容性迁移和生命周期钩子仍未做。
-- 控制令牌仍是一个共享令牌，任何持有者都能给任何工作区写凭据。
+- 共享的控制令牌仍然能给任何工作区写凭据，只应留给运维。需要让不同调用方各管各的工作区时，用 `-tokens` 配置作用域令牌，见 [control-plane.md](control-plane.md) 第 11 节：作用域令牌只能轮换自己作用域内的工作区，越权得到和"不存在"一样的 404。
 - 凭据文件模式是 0440，靠 Pod 的 fsGroup 让 agent 读取。容器里与 agent 同组的其他进程也能读到它。

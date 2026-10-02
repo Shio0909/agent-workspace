@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,8 +10,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"agent-workspace/internal/control"
@@ -56,23 +57,27 @@ func newUpstreamTransport() *http.Transport {
 }
 
 type Server struct {
-	Controller  *control.Controller
-	Token       string
+	Controller *control.Controller
+	// Token 是共享的管理员令牌，可以操作一切。
+	Token string
+	// Tokens 是可选的作用域令牌，只能操作自己作用域内的工作区。
+	Tokens      []ScopedToken
 	WakeTimeout time.Duration
 	Transport   http.RoundTripper
-	// Actor 是审计事件的默认归属，可被请求头 X-Actor 覆盖。它只是归属信息：
-	// 控制面只校验一个共享令牌，调用方可以声称任意身份。
+	// Actor 是审计事件的默认归属，可被请求头 X-Actor 覆盖。持共享令牌的调用方
+	// 可以声称任意身份，所以它只是归属信息；作用域令牌的归属由令牌名决定，
+	// 不接受自报。
 	Actor string
 }
 
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
+	mux := router{ServeMux: http.NewServeMux(), s: s}
 	// 存活与就绪分开：进程还在就该返回 200；依赖不可用只把实例摘出流量，
 	// 而不是让编排系统重启一个其实健康的进程。
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+	mux.open("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
+	mux.open("GET /ready", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), readinessTimeout)
 		defer cancel()
 		if err := s.Controller.Ready(ctx); err != nil {
@@ -89,11 +94,23 @@ func (s *Server) Handler() http.Handler {
 			slog.Error("write metrics", "error", err)
 		}
 	})
-	mux.HandleFunc("GET /v1/audit", func(w http.ResponseWriter, r *http.Request) {
+	// 审计、列表和创建不带 {id}，所以显式 open 并自己按作用域处理。审计没有按
+	// 工作区过滤的索引，作用域令牌必须点名一个自己能用的工作区。
+	mux.open("GET /v1/audit", func(w http.ResponseWriter, r *http.Request) {
 		query, err := auditQuery(r)
 		if err != nil {
 			fail(w, err)
 			return
+		}
+		if !principalOf(r).admin() {
+			if principalOf(r) == nil || query.Workspace == "" {
+				forbidden(w)
+				return
+			}
+			if !s.mayUse(r, query.Workspace) {
+				fail(w, control.ErrNotFound)
+				return
+			}
 		}
 		events, err := s.Controller.Audit(query)
 		if err != nil {
@@ -102,17 +119,32 @@ func (s *Server) Handler() http.Handler {
 		}
 		respond(w, http.StatusOK, events)
 	})
-	mux.HandleFunc("GET /v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
+	mux.open("GET /v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		p := principalOf(r)
+		if p == nil {
+			forbidden(w)
+			return
+		}
 		items := s.Controller.List()
+		if !p.admin() {
+			items = slices.DeleteFunc(items, func(item control.Workspace) bool {
+				return !p.token.allowsID(item.ID) || !p.token.allowsProfile(item.Profile)
+			})
+		}
 		sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 		respond(w, http.StatusOK, items)
 	})
-	mux.HandleFunc("POST /v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
+	mux.open("POST /v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
 			ID      string `json:"id"`
 			Profile string `json:"profile"`
 		}
 		if !decode(w, r, &in) {
+			return
+		}
+		// 作用域令牌只能创建落在自己作用域内的工作区，否则创建出来自己也用不了。
+		if p := principalOf(r); p == nil || (!p.admin() && !(p.token.allowsID(in.ID) && p.token.allowsProfile(in.Profile))) {
+			forbidden(w)
 			return
 		}
 		// 创建不需要幂等键：同 ID 同 profile 的重复创建本来就返回已有工作区。
@@ -247,9 +279,13 @@ func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 健康、就绪和指标之外的接口都要求控制令牌。探针请求来自编排系统，
 		// 拿不到业务凭据，所以只有这两个端点放开。
-		if requiresToken(r.URL.Path) && (s.Token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Control-Token")), []byte(s.Token)) != 1) {
-			respond(w, http.StatusUnauthorized, map[string]string{"error": "invalid control token"})
-			return
+		if requiresToken(r.URL.Path) {
+			p, ok := s.authenticate(r)
+			if !ok {
+				respond(w, http.StatusUnauthorized, map[string]string{"error": "invalid control token"})
+				return
+			}
+			r = withPrincipal(r, p)
 		}
 		mux.ServeHTTP(w, r)
 	})
@@ -318,7 +354,13 @@ func replay(w http.ResponseWriter, op control.Operation, err error) bool {
 }
 
 func (s *Server) actor(r *http.Request) string {
+	if p := principalOf(r); p != nil && p.token != nil {
+		return ActorPrefix + p.token.Name
+	}
 	actor := r.Header.Get("X-Actor")
+	if strings.HasPrefix(actor, ActorPrefix) {
+		actor = ""
+	}
 	if actor == "" {
 		actor = s.Actor
 	}
