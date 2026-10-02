@@ -22,6 +22,10 @@
       "CREDENTIAL_DIR": "/var/run/agent-credentials",
       "LLM_BASE_URL": "http://fake-llm.agent-workspace.svc.cluster.local:8081/v1",
       "LLM_MODEL": "demo"
-    }
+    },
+    "allowed_images": [
+      "agent-workspace-agent:*"
+    ],
+    "heartbeat_path": "/heartbeat"
   }
 }

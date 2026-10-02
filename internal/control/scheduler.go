@@ -100,10 +100,13 @@ func (s *Scheduler) Round(ctx context.Context) RoundStats {
 			go func(id string) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if _, err := s.Controller.Reconcile(roundCtx, id); err != nil {
+				endpoint, err := s.Controller.Reconcile(roundCtx, id)
+				if err != nil {
 					failed.Add(1)
 					slog.Warn("reconcile workspace", "workspace", id, "error", err)
+					return
 				}
+				s.Controller.Beat(roundCtx, id, endpoint)
 			}(ws.ID)
 		}
 		if !more {

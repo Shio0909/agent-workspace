@@ -46,6 +46,11 @@ type config struct {
 	readyCache   bool
 	activity     time.Duration
 	kubeCache    bool
+
+	upgradeSettle     time.Duration
+	heartbeatInterval time.Duration
+	heartbeatMisses   int
+	restartCooldown   time.Duration
 }
 
 func main() {
@@ -85,6 +90,8 @@ func run() error {
 	c.GracePeriod, c.StartupGrace = cfg.grace, cfg.startupGrace
 	c.DisableReadyCache = !cfg.readyCache
 	c.ActivityFlushInterval = cfg.activity
+	c.UpgradeSettle = cfg.upgradeSettle
+	c.HeartbeatInterval, c.HeartbeatMisses, c.RestartCooldown = cfg.heartbeatInterval, cfg.heartbeatMisses, cfg.restartCooldown
 	scheduler := control.NewScheduler(c)
 	scheduler.Interval, scheduler.RoundTimeout = cfg.interval, cfg.roundTimeout
 	scheduler.BatchSize, scheduler.Concurrency = cfg.batch, cfg.concurrency
@@ -147,6 +154,10 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.BoolVar(&cfg.readyCache, "ready-cache", true, "cache ready workspace endpoints")
 	fs.DurationVar(&cfg.activity, "activity-flush", control.DefaultActivityFlushInterval, "longest delay before request activity is persisted; 0 persists every request")
 	fs.BoolVar(&cfg.kubeCache, "kube-cache", true, "watch managed workloads and read runtime state from the local cache; false polls the API server (benchmark control)")
+	fs.DurationVar(&cfg.upgradeSettle, "upgrade-settle", 15*time.Second, "how long a workspace must stay ready on a new image before the upgrade is committed")
+	fs.DurationVar(&cfg.heartbeatInterval, "heartbeat-interval", 10*time.Second, "spacing between heartbeat polls of one workspace")
+	fs.IntVar(&cfg.heartbeatMisses, "heartbeat-misses", 3, "consecutive failed heartbeats before a workspace is restarted")
+	fs.DurationVar(&cfg.restartCooldown, "restart-cooldown", 5*time.Minute, "minimum time between heartbeat-triggered restarts of one workspace")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -182,6 +193,14 @@ func (c config) validate() error {
 		return errors.New("-batch must be in [1, 10000]")
 	case c.concurrency < 1 || c.concurrency > 64:
 		return errors.New("-sweep-concurrency must be in [1, 64]")
+	case c.upgradeSettle < 0:
+		return errors.New("-upgrade-settle must not be negative")
+	case c.heartbeatInterval <= 0:
+		return errors.New("-heartbeat-interval must be positive")
+	case c.heartbeatMisses < 1:
+		return errors.New("-heartbeat-misses must be at least 1")
+	case c.restartCooldown < 0:
+		return errors.New("-restart-cooldown must not be negative")
 	case c.activity < 0 || (c.activity > 0 && c.activity >= c.idle):
 		// Activity lost in a crash must stay well inside the restart grace,
 		// which is one idle timeout long.

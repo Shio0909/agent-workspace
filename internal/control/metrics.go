@@ -21,6 +21,10 @@ type Metrics struct {
 	Expirations        atomic.Int64
 	Suspensions        atomic.Int64
 	HardDeletes        atomic.Int64
+	UpgradeCommits     atomic.Int64
+	UpgradeRollbacks   atomic.Int64
+	HeartbeatFailures  atomic.Int64
+	HeartbeatRestarts  atomic.Int64
 	OperationsStarted  atomic.Int64
 	OperationReplays   atomic.Int64
 	OperationTakeovers atomic.Int64
@@ -187,6 +191,10 @@ func (c *Controller) WriteMetrics(out io.Writer) error {
 	writeValue(&b, "nc_expirations_total", "Deadlines which turned running or stopped workspaces into suspended.", "counter", m.Expirations.Load())
 	writeValue(&b, "nc_suspensions_total", "Workspaces whose workload was scaled to zero with storage retained.", "counter", m.Suspensions.Load())
 	writeValue(&b, "nc_hard_deletes_total", "Workspaces whose deployment, service and pvc were removed.", "counter", m.HardDeletes.Load())
+	writeValue(&b, "nc_upgrade_commits_total", "Image upgrades which stayed ready long enough to be committed.", "counter", m.UpgradeCommits.Load())
+	writeValue(&b, "nc_upgrade_rollbacks_total", "Image upgrades which did not become ready in time and were rolled back.", "counter", m.UpgradeRollbacks.Load())
+	writeValue(&b, "nc_heartbeat_failures_total", "Heartbeat polls which failed.", "counter", m.HeartbeatFailures.Load())
+	writeValue(&b, "nc_heartbeat_restarts_total", "Restarts triggered by lost heartbeats.", "counter", m.HeartbeatRestarts.Load())
 	writeValue(&b, "nc_operations_started_total", "Idempotency records created by a first submission.", "counter", m.OperationsStarted.Load())
 	writeValue(&b, "nc_operation_replays_total", "Submissions which reused an existing biz_id.", "counter", m.OperationReplays.Load())
 	writeValue(&b, "nc_operation_takeovers_total", "Stale processing records taken over by a later submission.", "counter", m.OperationTakeovers.Load())

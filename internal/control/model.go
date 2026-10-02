@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -28,6 +29,9 @@ var (
 	// biz_id 由调用方提供，允许 UUID 或带前缀的追踪号。限制字符集是因为它
 	// 会进入审计日志和状态快照，不希望出现控制字符或换行。
 	bizPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`)
+	// 镜像引用：registry/repo:tag 或 repo@sha256:...。只做字符集检查，是否
+	// 允许由 Profile.AllowedImages 决定。
+	imagePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$`)
 )
 
 // desired 与 phase 的取值。两者都会进入 JSON 快照和 HTTP 响应，改名等于改协议。
@@ -80,6 +84,14 @@ const (
 	// 凭据动作只记录版本号和键名，永远不记录值。
 	ActionCredentialSet   = "credential-set"
 	ActionCredentialClear = "credential-clear"
+	// 升级与心跳动作。upgrade-rollback 的结果记为 error：升级没有成功。
+	ActionUpgrade          = "upgrade"
+	ActionUpgradeCommit    = "upgrade-commit"
+	ActionUpgradeRollback  = "upgrade-rollback"
+	ActionRollback         = "rollback"
+	ActionHeartbeatLost    = "heartbeat-lost"
+	ActionHeartbeatRestart = "heartbeat-restart"
+	ActionHeartbeatBack    = "heartbeat-recovered"
 )
 
 const (
@@ -108,6 +120,15 @@ type Profile struct {
 	// 通过 API 注入凭据。它以文件而不是环境变量交付：文件会随 Secret 更新，
 	// 环境变量只能靠重启 Pod 才能换新。
 	CredentialPath string `json:"credential_path,omitempty"`
+	// AllowedImages lists the images a workspace of this profile may be
+	// upgraded to: exact references, or a prefix ending in "*". Empty disables
+	// upgrades, because an API that accepts any image is an API that runs any
+	// code in the cluster.
+	AllowedImages []string `json:"allowed_images,omitempty"`
+	// HeartbeatPath, when set, is polled on a running workspace. The workload
+	// reports whether it is busy, which counts as activity, and a workload that
+	// stops answering is restarted.
+	HeartbeatPath string `json:"heartbeat_path,omitempty"`
 }
 
 func (p Profile) Validate() error {
@@ -126,6 +147,14 @@ func (p Profile) Validate() error {
 		}
 		if p.CredentialPath == p.MountPath || p.CredentialPath == p.ConfigPath {
 			return fmt.Errorf("%w: credential_path must not overlap mount_path or config_path", ErrInvalid)
+		}
+	}
+	if p.HeartbeatPath != "" && p.HeartbeatPath[0] != '/' {
+		return fmt.Errorf("%w: heartbeat_path must be absolute", ErrInvalid)
+	}
+	for _, pattern := range p.AllowedImages {
+		if !imagePattern.MatchString(strings.TrimSuffix(pattern, "*")) || pattern == "*" {
+			return fmt.Errorf("%w: invalid allowed_images entry %q", ErrInvalid, pattern)
 		}
 	}
 	return nil
@@ -158,6 +187,31 @@ type Workspace struct {
 	CredentialVersion   int       `json:"credential_version,omitempty"`
 	CredentialKeys      []string  `json:"credential_keys,omitempty"`
 	CredentialUpdatedAt time.Time `json:"credential_updated_at,omitempty"`
+
+	// Image overrides the profile's image for this workspace. Empty means
+	// "follow the profile". It is set by Upgrade and cleared when a rollback
+	// returns to the profile's own image.
+	Image string `json:"image,omitempty"`
+	// PreviousImage is the image the workspace ran before its last committed
+	// upgrade, kept so a later bad release can be undone by hand.
+	PreviousImage string `json:"previous_image,omitempty"`
+	// RolloutPending means the image above has been changed and the runtime has
+	// not yet been seen running it. Reconcile only calls Ensure on a workspace
+	// that is not ready, so without this flag a ready workspace would keep its
+	// old image after a rollback.
+	RolloutPending bool          `json:"rollout_pending,omitempty"`
+	Upgrade        *UpgradeState `json:"upgrade,omitempty"`
+	LastUpgrade    *UpgradeDone  `json:"last_upgrade,omitempty"`
+
+	// HeartbeatAt is the last successful heartbeat. It is persisted at most
+	// once per ActivityFlushInterval, like request activity, so a healthy
+	// workspace does not cost a write per beat.
+	HeartbeatAt  time.Time `json:"heartbeat_at,omitempty"`
+	Unresponsive bool      `json:"unresponsive,omitempty"`
+	// AutoRestartAt is the last restart the controller triggered itself after
+	// lost heartbeats; it rate-limits further automatic restarts.
+	AutoRestartAt time.Time `json:"auto_restart_at,omitempty"`
+	AgentVersion  string    `json:"agent_version,omitempty"`
 }
 
 // DeletionReason 的取值。
@@ -189,6 +243,10 @@ type Observation struct {
 	Exists   bool
 	Ready    bool
 	Endpoint string
+	// Image is the image of the pods that are actually serving, reported only
+	// once the rollout has finished. Ready alone cannot tell an upgraded
+	// workload from the old one that is still up while the rollout starts.
+	Image string
 }
 
 // StartupTimestamps 是最新 pod 的就绪时间线，用来拆冷启动耗时。零值表示那个
