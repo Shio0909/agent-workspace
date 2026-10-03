@@ -362,28 +362,38 @@ func (s *Store) putOperationIfAbsent(op Operation) (Operation, bool, error) {
 	return op, false, nil
 }
 
-func (s *Store) putOperation(op Operation) error {
+// updateOperation 是已有幂等记录唯一的修改入口：读取、判定、落盘、更新内存
+// 都在 opsMu 内完成。fn 拿到的是此刻的最新记录，返回 false 表示不写入。这样
+// "只有 processing 才能收尾/接管"这类状态机条件基于锁内的最新状态判断，而不是
+// 调用方更早读到的快照，不会因为交错执行把终态记录改回去。返回值是 fn 返回
+// false 时的当前记录，或写入后的新记录。
+func (s *Store) updateOperation(bizID string, fn func(cur Operation) (Operation, bool)) (Operation, error) {
 	s.opsMu.Lock()
 	defer s.opsMu.Unlock()
 	s.mu.Lock()
-	_, ok := s.ops[op.BizID]
+	cur, ok := s.ops[bizID]
 	s.mu.Unlock()
 	if !ok {
-		return ErrNotFound
+		return Operation{}, ErrNotFound
 	}
-	v, err := json.Marshal(op)
+	next, write := fn(cur)
+	if !write {
+		return cur, nil
+	}
+	next.BizID = cur.BizID
+	v, err := json.Marshal(next)
 	if err != nil {
-		return err
+		return cur, err
 	}
 	if err := s.commits.do(func(tx *bolt.Tx) error {
-		return tx.Bucket(operationsBucket).Put([]byte(op.BizID), v)
+		return tx.Bucket(operationsBucket).Put([]byte(next.BizID), v)
 	}); err != nil {
-		return err
+		return cur, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.ops[op.BizID] = op
-	return nil
+	s.ops[next.BizID] = next
+	return next, nil
 }
 
 // evictOperations 选出插入 incoming 之后需要淘汰的记录，不修改 ops。只淘汰

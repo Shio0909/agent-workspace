@@ -311,7 +311,7 @@ func (s *Server) lifecycle(w http.ResponseWriter, r *http.Request, action string
 		return
 	}
 	item, applyErr := apply(s.actor(r), id)
-	if err := s.Controller.FinishOperation(bizID, applyErr); err != nil {
+	if err := s.Controller.FinishOperation(op, applyErr); err != nil {
 		slog.Error("finish operation", "biz_id", bizID, "workspace", id, "error", err)
 	}
 	if applyErr != nil {
@@ -390,15 +390,17 @@ func (s *Server) tokenBudget(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	bizID := r.Header.Get("X-Biz-Id")
+	var op control.Operation
 	if bizID != "" {
-		op, err := s.Controller.BeginOperation(bizID, id, control.OpTokenBudget)
-		if replay(w, op, err) {
+		var beginErr error
+		op, beginErr = s.Controller.BeginOperation(bizID, id, control.OpTokenBudget)
+		if replay(w, op, beginErr) {
 			return
 		}
 	}
 	item, err := s.Controller.SetTokenBudget(s.actor(r), id, *in.TokenBudget)
 	if bizID != "" {
-		if finishErr := s.Controller.FinishOperation(bizID, err); finishErr != nil {
+		if finishErr := s.Controller.FinishOperation(op, err); finishErr != nil {
 			slog.Error("finish operation", "biz_id", bizID, "workspace", id, "error", finishErr)
 		}
 	}

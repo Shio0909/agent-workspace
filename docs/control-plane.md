@@ -15,11 +15,11 @@
 ### 数据结构与键的选择
 
 ```
-Operation{BizID, Workspace, Type, Status, Error, StartedAt, FinishedAt}
+Operation{BizID, Workspace, Type, Status, Generation, Error, StartedAt, FinishedAt}
 Status: processing -> success | failed   （两个终态都不可逆）
 ```
 
-- **BizID 是唯一的幂等键**，`Type` 只是记录的一部分。这样 `FinishOperation(bizID, err)` 的语义是明确的：一个 biz_id 对应一次调用方请求。
+- **BizID 是唯一的幂等键**，`Type` 只是记录的一部分。这样一个 biz_id 对应一次调用方请求；`FinishOperation(op, err)` 收尾的是 `BeginOperation` 返回的那条记录（见下文 `Generation`）。
 - 同一个 biz_id 换了 `Type` 或换了工作区 → `ErrConflict`。控制面不猜调用方想要什么，直接拒绝，避免"用旧的键执行新的动作"这种最危险的组合。
 
 ### 状态机
@@ -31,9 +31,11 @@ Status: processing -> success | failed   （两个终态都不可逆）
 | `success` | `ErrOperationSucceeded` | 200 + 幂等记录 |
 | `failed` | `ErrOperationFailed` + 原始错误文本 | 409 + 原始错误文本 |
 
-- **调用方只有在 `err == nil` 时才允许执行动作**，执行完必须调用 `FinishOperation`。收尾是"先到先得"：重复收尾不会把 `success` 翻成 `failed`。
+- **调用方只有在 `err == nil` 时才允许执行动作**，执行完必须用 `BeginOperation` 返回的记录调用 `FinishOperation`。收尾是"先到先得"：重复收尾不会把 `success` 翻成 `failed`。
 - **failed 是终态**。同一个 biz_id 重放失败请求会拿到第一次的错误，不会重试。要重试就换一个新的 biz_id。这是刻意的：如果 failed 可以复用，那么"客户端在超时后重试"和"服务端已经执行了一半"就无法区分。
 - **processing 记录有存活上限**（`OperationLease`，默认 10 分钟）。控制器在执行动作中途崩溃会留下一条永远不会自己结束的记录，不接管就等于永久锁死这个 biz_id。超过上限后，后来的请求会接管它。
+- **状态转换在存储锁内按最新记录判定**。收尾要求记录此刻仍是 `processing` 且仍是自己那一代；接管要求记录仍是 `processing`、仍是读到的那一代、租约确实已过。调用方更早读到的快照只用来提出请求，不作为写入依据，所以交错执行不会把终态记录改回去。
+- **`Generation` 标识当前持有记录的那一次执行**：首次占用为 1，每次接管加 1。被接管的旧持有者迟到的收尾得到 `ErrOperationSuperseded`，结果不会写入，也就不会给新持有者仍在执行的操作定性。记录已进入终态时，旧持有者的收尾和其他重复收尾一样是无操作。升级前落盘的记录没有该字段（按 0 处理），仍可被接管。
 
 ### 存储与保留
 
@@ -239,7 +241,7 @@ suspended --宽限期满--> deleted        （硬删 Deployment/Service/PVC）
 
 覆盖（`go test -race ./...`）：
 
-- 幂等：并发提交同一 biz_id 只执行一次；重放成功/失败/进行中的记录；同一 biz_id 换类型或换工作区被拒；陈旧 processing 记录被接管；收尾先到先得；保留上限只淘汰终态记录；快照跨重启保留。
+- 幂等：并发提交同一 biz_id 只执行一次；重放成功/失败/进行中的记录；同一 biz_id 换类型或换工作区被拒；陈旧 processing 记录被接管（并发接管只有一个赢家，用过期快照接管不能让终态记录复活）；收尾先到先得（含并发交错）；被接管的旧持有者不能收尾新一代；保留上限只淘汰终态记录；快照跨重启保留。
 - 审计：全生命周期动作、跨重启可见、按工作区/动作/时间/条数过滤、半行容错、只追加、写失败只计数不回滚、同一故障不重复记录。
 - 回收：挂起保留存储（`Runtime.Delete` 调用次数为 0）、宽限期满才硬删、宽限期跨重启延续、启动静默期阻止回收、租约阻止到期挂起、显式删除跳过宽限期、过期工作区拒绝唤醒与续期恢复。
 - 调度：分页不重不漏、批大小与并发上限（含并发确实发生）、单轮超时、单条失败不中断、跳过墓碑、`Run` 能被取消。
