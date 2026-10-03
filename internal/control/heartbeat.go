@@ -57,6 +57,7 @@ func (c *Controller) Beat(ctx context.Context, id, endpoint string) {
 		return
 	}
 	s.nextBeat = now.Add(c.HeartbeatInterval)
+	epoch := w.RunEpoch
 	s.mu.Unlock()
 
 	if endpoint == "" {
@@ -72,6 +73,15 @@ func (c *Controller) Beat(ctx context.Context, id, endpoint string) {
 	defer s.mu.Unlock()
 	w, err = c.store.Get(id)
 	if err != nil || w.Desired != DesiredRunning {
+		return
+	}
+	if w.RunEpoch != epoch {
+		// The workload was stopped, restarted or replaced while the request was
+		// in flight. The answer, or the failure to get one, describes the old
+		// run; applying it would stamp stale version and usage on the new run
+		// or count a dead pod's silence against a healthy one. The next beat
+		// polls the current workload.
+		slog.Debug("heartbeat result discarded: workload replaced during poll", "workspace", id)
 		return
 	}
 	now = c.now()

@@ -39,6 +39,7 @@ If the profile sets `heartbeat_path` (the agent profile uses `/heartbeat`), the 
 - After `-heartbeat-misses` consecutive failures the workspace is marked `unresponsive` and restarted. A restart is allowed at most once per `-restart-cooldown`, so a crash loop does not become a restart storm.
 - A 4xx reply is treated as a configuration error (wrong path or auth), not as a dead process, and never triggers a restart.
 - Workspaces that are not ready are only polled if they were healthy recently, so a workspace that is still starting is not restarted.
+- The poll runs outside the workspace lock, so the workload can be stopped, started or restarted while a request is in flight. Each workspace carries a `run_epoch` that the store advances whenever its desired state, restart intent, rollout intent or image changes. A beat remembers the epoch it started in and drops its result, success or failure, if the epoch moved. Otherwise a reply from the previous run would stamp its version on the new one, and the previous run's silence would be counted against a healthy replacement.
 
 Flags:
 
@@ -106,5 +107,6 @@ Metrics: `nc_tokens_total{profile,kind="prompt|completion"}` and `nc_budget_susp
 - Rollback goes back one step. There is no version history beyond `previous_image`.
 - An upgrade is one-workspace-at-a-time; there is no fleet rollout or canary.
 - Heartbeat only tells whether the process answers. It cannot tell whether the agent's answers are good.
+- `run_epoch` follows the controller's own intents. A pod replaced outside them (for example by node loss) keeps the epoch, so a reply from the old pod that arrives after the replacement is still applied. Closing that needs a workload UID from the runtime.
 - Verified on a single-node kind cluster, not on a production cluster.
 - Token usage is only as good as the workload's report. A workload that lies about usage can evade its budget; the budget limits cost, it is not a sandbox.
