@@ -274,15 +274,28 @@ func (s *Store) keyLock(id string) *sync.Mutex {
 }
 
 // Put 持久化一个工作区。写入成本只和这一条记录有关，与工作区总数无关。
+//
+// RunEpoch 由这里统一维护，调用方传入的值会被忽略：以已存记录为准，工作负载
+// 被换掉（见 replacesWorkload）时加一。放在写入的唯一入口，是因为换掉工作负载
+// 的路径分散在停止、重启、凭据轮换、升级、回收等十几处，逐处手工加一迟早漏掉。
 func (s *Store) Put(w Workspace) error {
 	w = clone(w)
+	l := s.keyLock(w.ID)
+	l.Lock()
+	defer l.Unlock()
+	s.mu.Lock()
+	prev, existed := s.items[w.ID]
+	s.mu.Unlock()
+	if existed {
+		w.RunEpoch = prev.RunEpoch
+		if replacesWorkload(prev, w) {
+			w.RunEpoch++
+		}
+	}
 	v, err := json.Marshal(w)
 	if err != nil {
 		return err
 	}
-	l := s.keyLock(w.ID)
-	l.Lock()
-	defer l.Unlock()
 	if err := s.commits.do(func(tx *bolt.Tx) error {
 		return tx.Bucket(workspacesBucket).Put([]byte(w.ID), v)
 	}); err != nil {

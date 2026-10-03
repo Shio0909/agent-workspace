@@ -222,6 +222,12 @@ type Workspace struct {
 	Upgrade        *UpgradeState `json:"upgrade,omitempty"`
 	LastUpgrade    *UpgradeDone  `json:"last_upgrade,omitempty"`
 
+	// RunEpoch identifies which run of the workload the workspace is in. Store.Put
+	// advances it whenever the workload is stopped, started, restarted or given
+	// a different image (see replacesWorkload); callers cannot set it. A result
+	// obtained from a workload is only valid for the epoch it was requested in.
+	RunEpoch int64 `json:"run_epoch,omitempty"`
+
 	// HeartbeatAt is the last successful heartbeat. It is persisted at most
 	// once per ActivityFlushInterval, like request activity, so a healthy
 	// workspace does not cost a write per beat.
@@ -251,6 +257,18 @@ const (
 	DeletedByUser  = "user"
 	DeletedByGrace = "grace"
 )
+
+// replacesWorkload 判断 next 相对 prev 是否换了一次工作负载：期望状态、重启意图
+// 或镜像发生变化。每一项变化要么停掉、要么重建、要么换掉正在运行的 pod，所以
+// 在变化之前发出的锁外请求（比如心跳）拿到的结果不再描述现在这个工作负载。
+// 意图被执行（RestartPending 或 RolloutPending 清除）同样算一次，因为真正换掉
+// pod 发生在这里，而不是在意图被记录的时刻。
+func replacesWorkload(prev, next Workspace) bool {
+	return prev.Desired != next.Desired ||
+		prev.RestartPending != next.RestartPending ||
+		prev.RolloutPending != next.RolloutPending ||
+		prev.Image != next.Image
+}
 
 // expired 判断租期是否已过。零值 ExpiresAt 表示永不过期。
 func (w Workspace) expired(now time.Time) bool {
