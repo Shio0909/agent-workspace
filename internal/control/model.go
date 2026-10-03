@@ -27,6 +27,9 @@ var (
 	ErrOperationInProgress = errors.New("operation already in progress")
 	ErrOperationSucceeded  = errors.New("operation already succeeded")
 	ErrOperationFailed     = errors.New("operation already failed")
+	// ErrOperationSuperseded 表示这次收尾所属的那一代执行已经被后来的接管取代，
+	// 记录现在归新的持有者，旧持有者的结果不会写进去。
+	ErrOperationSuperseded = errors.New("operation was taken over by a later attempt")
 
 	namePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,39}$`)
 	// biz_id 由调用方提供，允许 UUID 或带前缀的追踪号。限制字符集是因为它
@@ -274,6 +277,11 @@ type Operation struct {
 	Workspace string `json:"workspace"`
 	Type      string `json:"type"`
 	Status    string `json:"status"`
+	// Generation 标识当前持有这条记录的那一次执行：首次占用为 1，每次过期
+	// 接管加 1。FinishOperation 必须带着 BeginOperation 返回的这一代，否则
+	// 被接管的旧持有者迟到的收尾会给新持有者仍在执行的操作定性。升级前落盘的
+	// 记录没有这个字段（读出为 0），按"第 0 代"处理，接管后进入第 1 代。
+	Generation int64 `json:"generation,omitempty"`
 	// Error 只保存消息文本。重启后无法还原原始错误类型，所以重放失败时
 	// 只能给出消息，不能保证和第一次的 HTTP 状态码一致。
 	Error      string    `json:"error,omitempty"`

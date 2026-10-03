@@ -135,16 +135,18 @@ func TestMetricsCountIdleStopsAndLeases(t *testing.T) {
 
 func TestMetricsCountOperationsByStatus(t *testing.T) {
 	c, _ := fixture(t)
-	if _, err := c.BeginOperation("biz-ok", "demo", OpStart); err != nil {
+	ok, err := c.BeginOperation("biz-ok", "demo", OpStart)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.FinishOperation("biz-ok", nil); err != nil {
+	if err := c.FinishOperation(ok, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.BeginOperation("biz-bad", "demo", OpStop); err != nil {
+	bad, err := c.BeginOperation("biz-bad", "demo", OpStop)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.FinishOperation("biz-bad", errors.New("apply failed")); err != nil {
+	if err := c.FinishOperation(bad, errors.New("apply failed")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.BeginOperation("biz-open", "demo", OpRestart); err != nil {

@@ -174,11 +174,12 @@ func applyStart(c *Controller, id string) error {
 // submitGated 复刻 handler 的三步：占用幂等记录 -> 只有 err == nil 才执行动作
 // -> 收尾。
 func submitGated(c *Controller, bizID, id, opType string, apply func() error) (executed bool, err error) {
-	if _, err := c.BeginOperation(bizID, id, opType); err != nil {
+	op, err := c.BeginOperation(bizID, id, opType)
+	if err != nil {
 		return false, err
 	}
 	applyErr := apply()
-	if err := c.FinishOperation(bizID, applyErr); err != nil {
+	if err := c.FinishOperation(op, applyErr); err != nil {
 		return true, err
 	}
 	return true, applyErr

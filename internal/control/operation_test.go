@@ -14,7 +14,8 @@ import (
 // 返回的 proceeded 表示这次提交是否真的执行了动作。
 func submit(t *testing.T, c *Controller, bizID, id, action string) (proceeded bool) {
 	t.Helper()
-	if _, err := c.BeginOperation(bizID, id, action); err != nil {
+	op, err := c.BeginOperation(bizID, id, action)
+	if err != nil {
 		return false
 	}
 	var applyErr error
@@ -30,7 +31,7 @@ func submit(t *testing.T, c *Controller, bizID, id, action string) (proceeded bo
 	default:
 		t.Fatalf("unknown action %q", action)
 	}
-	if err := c.FinishOperation(bizID, applyErr); err != nil {
+	if err := c.FinishOperation(op, applyErr); err != nil {
 		t.Fatalf("finish operation: %v", err)
 	}
 	return true
@@ -45,7 +46,7 @@ func TestConcurrentSubmissionsOfOneBizIDApplyOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := c.BeginOperation("biz-concurrent", "demo", OpDelete)
+			op, err := c.BeginOperation("biz-concurrent", "demo", OpDelete)
 			if err != nil {
 				if !errors.Is(err, ErrOperationInProgress) && !errors.Is(err, ErrOperationSucceeded) {
 					t.Errorf("unexpected error: %v", err)
@@ -57,7 +58,7 @@ func TestConcurrentSubmissionsOfOneBizIDApplyOnce(t *testing.T) {
 			if applyErr != nil {
 				t.Errorf("apply: %v", applyErr)
 			}
-			if err := c.FinishOperation("biz-concurrent", applyErr); err != nil {
+			if err := c.FinishOperation(op, applyErr); err != nil {
 				t.Errorf("finish: %v", err)
 			}
 		}()
@@ -121,12 +122,13 @@ func TestReplayedOperationDoesNotRepeatItsSideEffect(t *testing.T) {
 
 func TestFailedOperationStaysFailedOnReplay(t *testing.T) {
 	c, _ := fixture(t)
-	if _, err := c.BeginOperation("biz-fail", "missing", OpStart); err != nil {
+	first, err := c.BeginOperation("biz-fail", "missing", OpStart)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.SetDesired(testActor, "missing", DesiredRunning); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected the workspace to be missing: %v", err)
-	} else if err := c.FinishOperation("biz-fail", err); err != nil {
+	} else if err := c.FinishOperation(first, err); err != nil {
 		t.Fatal(err)
 	}
 	op, err := c.BeginOperation("biz-fail", "missing", OpStart)
@@ -193,23 +195,24 @@ func TestStaleProcessingRecordIsTakenOver(t *testing.T) {
 
 func TestFinishOperationIsFirstWriteWins(t *testing.T) {
 	c, _ := fixture(t)
-	if _, err := c.BeginOperation("biz-once", "demo", OpStop); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.FinishOperation("biz-once", nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.FinishOperation("biz-once", errors.New("late duplicate")); err != nil {
-		t.Fatal(err)
-	}
-	op, err := c.store.GetOperation("biz-once")
+	op, err := c.BeginOperation("biz-once", "demo", OpStop)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if op.Status != OpSuccess || op.Error != "" {
-		t.Fatalf("a duplicate finish overwrote the terminal state: %+v", op)
+	if err := c.FinishOperation(op, nil); err != nil {
+		t.Fatal(err)
 	}
-	if err := c.FinishOperation("biz-unknown", nil); !errors.Is(err, ErrNotFound) {
+	if err := c.FinishOperation(op, errors.New("late duplicate")); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := c.store.GetOperation("biz-once")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != OpSuccess || stored.Error != "" {
+		t.Fatalf("a duplicate finish overwrote the terminal state: %+v", stored)
+	}
+	if err := c.FinishOperation(Operation{BizID: "biz-unknown", Generation: 1}, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("finishing an unknown record was accepted: %v", err)
 	}
 }
@@ -225,11 +228,12 @@ func TestOperationRetentionEvictsOnlyFinishedRecords(t *testing.T) {
 	now := time.Now()
 	c.now = func() time.Time { return now }
 	for _, biz := range []string{"a", "b", "c"} {
-		if _, err := c.BeginOperation(biz, "demo", OpStart); err != nil {
+		op, err := c.BeginOperation(biz, "demo", OpStart)
+		if err != nil {
 			t.Fatal(err)
 		}
 		now = now.Add(time.Minute)
-		if err := c.FinishOperation(biz, nil); err != nil {
+		if err := c.FinishOperation(op, nil); err != nil {
 			t.Fatal(err)
 		}
 		now = now.Add(time.Minute)
@@ -282,10 +286,11 @@ func TestOperationSnapshotSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := New(s, &fakeRuntime{}, map[string]Profile{"demo": {}}, time.Minute)
-	if _, err := c.BeginOperation("biz-durable", "demo", OpStop); err != nil {
+	op, err := c.BeginOperation("biz-durable", "demo", OpStop)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.FinishOperation("biz-durable", nil); err != nil {
+	if err := c.FinishOperation(op, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {

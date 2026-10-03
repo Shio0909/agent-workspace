@@ -20,7 +20,7 @@ func (c *Controller) BeginOperation(bizID, workspace, opType string) (Operation,
 		return Operation{}, fmt.Errorf("%w: biz_id, workspace and a known type are required", ErrInvalid)
 	}
 	now := c.now()
-	fresh := Operation{BizID: bizID, Workspace: workspace, Type: opType, Status: OpProcessing, StartedAt: now}
+	fresh := Operation{BizID: bizID, Workspace: workspace, Type: opType, Status: OpProcessing, Generation: 1, StartedAt: now}
 	existing, found, err := c.store.putOperationIfAbsent(fresh)
 	if err != nil {
 		return Operation{}, err
@@ -33,13 +33,21 @@ func (c *Controller) BeginOperation(bizID, workspace, opType string) (Operation,
 	if existing.Type != opType || existing.Workspace != workspace {
 		return existing, fmt.Errorf("%w: biz_id %q already used for %s on %s", ErrConflict, bizID, existing.Type, existing.Workspace)
 	}
-	switch existing.Status {
-	case OpSuccess:
-		return existing, ErrOperationSucceeded
-	case OpFailed:
-		return existing, fmt.Errorf("%w: %s", ErrOperationFailed, existing.Error)
-	default:
+	if existing.Status == OpProcessing {
 		return c.takeOverStale(existing, now)
+	}
+	return existing, replayError(existing)
+}
+
+// replayError 把一条已存在的记录翻译成重复提交应得到的结论。
+func replayError(op Operation) error {
+	switch op.Status {
+	case OpSuccess:
+		return ErrOperationSucceeded
+	case OpFailed:
+		return fmt.Errorf("%w: %s", ErrOperationFailed, op.Error)
+	default:
+		return fmt.Errorf("%w: started at %s", ErrOperationInProgress, op.StartedAt.UTC().Format(time.RFC3339))
 	}
 }
 
@@ -47,34 +55,58 @@ func (c *Controller) BeginOperation(bizID, workspace, opType string) (Operation,
 // 一条永远不会自己结束的记录，不接管就等于永久锁死这个 biz_id。接管意味着
 // 原请求可能仍在别处执行，所以只有动作本身幂等（写入目标状态）时这个取舍才
 // 成立：重启后的副作用是重写一次同样的目标状态，而不是多扣一次钱。
-func (c *Controller) takeOverStale(existing Operation, now time.Time) (Operation, error) {
-	if now.Sub(existing.StartedAt) < c.OperationLease {
-		return existing, fmt.Errorf("%w: started at %s", ErrOperationInProgress, existing.StartedAt.UTC().Format(time.RFC3339))
+//
+// seen 只是调用方更早读到的快照。是否接管要在存储锁内按最新记录重新判定：
+// 记录仍是 processing、仍是 seen 的那一代、租约确实已过，三者都成立才接管，
+// 并把代数加一。任何一条不成立，都按最新记录给出重复提交的结论，而不是用
+// 旧快照覆盖别人已经写下的结果。
+func (c *Controller) takeOverStale(seen Operation, now time.Time) (Operation, error) {
+	took := false
+	cur, err := c.store.updateOperation(seen.BizID, func(cur Operation) (Operation, bool) {
+		if cur.Status != OpProcessing || cur.Generation != seen.Generation || now.Sub(cur.StartedAt) < c.OperationLease {
+			return cur, false
+		}
+		cur.Generation++
+		cur.StartedAt, cur.FinishedAt, cur.Error = now, time.Time{}, ""
+		took = true
+		return cur, true
+	})
+	if err != nil {
+		return seen, err
 	}
-	taken := existing
-	taken.StartedAt, taken.FinishedAt, taken.Error = now, time.Time{}, ""
-	if err := c.store.putOperation(taken); err != nil {
-		return existing, err
+	if !took {
+		return cur, replayError(cur)
 	}
 	c.Metrics.OperationTakeovers.Add(1)
-	return taken, nil
+	return cur, nil
 }
 
-// FinishOperation 把记录置为终态。终态先到先得：重复收尾不会把已经成功的
-// 记录翻成失败。传入 nil 表示成功，否则记录错误文本。
-func (c *Controller) FinishOperation(bizID string, opErr error) error {
-	op, err := c.store.GetOperation(bizID)
-	if err != nil {
-		return err
+// FinishOperation 把记录置为终态。op 必须是 BeginOperation 返回的那条记录：
+// 收尾绑定到它所属的那一代执行。终态先到先得，重复收尾不会把已经成功的记录
+// 翻成失败。传入 nil 表示成功，否则记录错误文本。
+//
+// 如果记录已被后来的接管换到新一代，旧持有者的结果不会写入，返回
+// ErrOperationSuperseded，由调用方决定如何记录这件事。
+func (c *Controller) FinishOperation(op Operation, opErr error) error {
+	superseded := false
+	_, err := c.store.updateOperation(op.BizID, func(cur Operation) (Operation, bool) {
+		if cur.Status != OpProcessing {
+			return cur, false
+		}
+		if cur.Generation != op.Generation {
+			superseded = true
+			return cur, false
+		}
+		cur.FinishedAt = c.now()
+		if opErr != nil {
+			cur.Status, cur.Error = OpFailed, opErr.Error()
+		} else {
+			cur.Status = OpSuccess
+		}
+		return cur, true
+	})
+	if err == nil && superseded {
+		return fmt.Errorf("%w: biz_id %q", ErrOperationSuperseded, op.BizID)
 	}
-	if op.Status != OpProcessing {
-		return nil
-	}
-	op.FinishedAt = c.now()
-	if opErr != nil {
-		op.Status, op.Error = OpFailed, opErr.Error()
-	} else {
-		op.Status = OpSuccess
-	}
-	return c.store.putOperation(op)
+	return err
 }
