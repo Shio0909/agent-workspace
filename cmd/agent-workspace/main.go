@@ -30,8 +30,12 @@ const (
 )
 
 type config struct {
+	mode string
+	// out / in 只在 backup / restore 模式下使用。
 	listen       string
 	data         string
+	out          string
+	in           string
 	profiles     string
 	tokens       string
 	namespace    string
@@ -65,6 +69,14 @@ func run() error {
 	cfg, err := parseConfig(os.Args[1:], os.Getenv)
 	if err != nil {
 		return err
+	}
+	// 备份与恢复是离线流程：不加载 profile 和令牌，也不需要控制令牌。
+	// 离线语义由 Backup/Restore 内部的目录锁强制。
+	switch cfg.mode {
+	case "backup":
+		return control.Backup(cfg.data, cfg.out)
+	case "restore":
+		return control.Restore(cfg.in, cfg.data)
 	}
 	profiles, err := loadProfiles(cfg.profiles)
 	if err != nil {
@@ -144,8 +156,11 @@ func run() error {
 func parseConfig(args []string, getenv func(string) string) (config, error) {
 	cfg := config{}
 	fs := flag.NewFlagSet("agent-workspace", flag.ContinueOnError)
+	fs.StringVar(&cfg.mode, "mode", "serve", "serve, backup or restore")
 	fs.StringVar(&cfg.listen, "listen", "127.0.0.1:8090", "HTTP listen address")
 	fs.StringVar(&cfg.data, "data", "data", "exclusive controller data directory")
+	fs.StringVar(&cfg.out, "out", "", "backup output file (-mode=backup)")
+	fs.StringVar(&cfg.in, "in", "", "backup input file (-mode=restore)")
 	fs.StringVar(&cfg.profiles, "profiles", "configs/profiles.json", "runtime profile file")
 	fs.StringVar(&cfg.tokens, "tokens", "", "optional scoped control token file (SHA-256 digests); empty means only the shared token")
 	fs.StringVar(&cfg.namespace, "namespace", "agent-workspace", "dedicated Kubernetes namespace")
@@ -174,6 +189,27 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 // validate 把非法配置挡在启动阶段。带病运行的代价是几小时后才暴露的坏行为，
 // 而一条启动失败是立刻可见、可以马上修的。
 func (c config) validate() error {
+	switch c.mode {
+	case "backup":
+		switch {
+		case c.out == "":
+			return errors.New("-out is required for -mode=backup")
+		case c.data == "":
+			return errors.New("-data is required for -mode=backup")
+		}
+		return nil
+	case "restore":
+		switch {
+		case c.in == "":
+			return errors.New("-in is required for -mode=restore")
+		case c.data == "":
+			return errors.New("-data is required for -mode=restore")
+		}
+		return nil
+	case "serve":
+	default:
+		return fmt.Errorf("-mode must be serve, backup or restore, got %q", c.mode)
+	}
 	switch {
 	case c.listen == "":
 		return errors.New("-listen must not be empty")

@@ -176,8 +176,10 @@ func trimComma(s string) string {
 	return s
 }
 
-// observeStartPhases 记录冷启动的分阶段耗时：调度、拉镜像+启动、就绪等待。
-// 只记录两端时间戳都存在的阶段，缺一个就跳过那一段而不是编造。
+// observeStartPhases 记录冷启动的分阶段耗时：调度、拉镜像+启动（合并段）、
+// 就绪等待。只记录两端时间戳都存在的阶段，缺一个就跳过那一段而不是编造。
+// 三段之和与 total 的起止点不同（base 被截断到秒、total 用控制器真实时钟），
+// 不能直接相加比较，见 docs/cold-start.md。
 func (m *Metrics) observeStartPhases(t0 time.Time, ts StartupTimestamps) {
 	if ts.Scheduled.IsZero() {
 		return
@@ -263,8 +265,11 @@ func (c *Controller) WriteMetrics(out io.Writer) error {
 	writeValue(&b, "nc_event_reconcile_failures_total", "Event-driven reconciles which failed and were requeued with backoff.", "counter", m.EventReconcileErrors.Load())
 	m.writeUsage(&b)
 	m.AcquireWait.writeTo(&b, "nc_workspace_acquire_seconds", "Time a request waited for a ready endpoint, including cold starts.", "", "")
+	// 注意 "pull" 的真实口径：Pod condition 时间戳不含 kubelet 的拉取事件，
+	// 这一段实际是"拉镜像 + 容器启动"的合并耗时（PodScheduled → ContainerStarted），
+	// 想单独拆出拉取需要消费 kube Event 资源，见 docs/cold-start.md。
 	const startMetric = "nc_workspace_start_seconds"
-	fmt.Fprintf(&b, "# HELP %s Cold-start duration by phase, from pod condition timestamps.\n# TYPE %s histogram\n", startMetric, startMetric)
+	fmt.Fprintf(&b, "# HELP %s Cold-start duration by phase, from pod condition timestamps. The pull phase is image pull plus container start (pod conditions do not expose pull separately).\n# TYPE %s histogram\n", startMetric, startMetric)
 	for _, phase := range []struct {
 		name string
 		h    *Histogram

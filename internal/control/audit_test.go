@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -291,5 +292,153 @@ func TestAuditRecordsIdleStop(t *testing.T) {
 	}
 	if w, _ := c.Get("demo"); w.Desired != DesiredStopped {
 		t.Fatalf("idle stop did not take effect: %+v", w)
+	}
+}
+
+func TestAuditRotationRetainsHistoryAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	log, err := openAuditLog(path, 1, 2) // 每条完整记录占一个文件。
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range []string{"a", "b", "c", "d", "e", "f"} {
+		if err := log.Append(AuditEvent{Action: action}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths, err := log.archivePaths()
+	if err != nil || len(paths) != 2 {
+		t.Fatalf("archives=%v, err=%v", paths, err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	log, err = openAuditLog(path, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	if err := log.Append(AuditEvent{Action: "g"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := log.Query(AuditQuery{})
+	if err != nil || strings.Join(actionsOf(got), ",") != "e,f,g" {
+		t.Fatalf("retained history=%v, err=%v", actionsOf(got), err)
+	}
+	got, err = log.Query(AuditQuery{Limit: 2})
+	if err != nil || strings.Join(actionsOf(got), ",") != "e,f" {
+		t.Fatalf("limited history=%v, err=%v", actionsOf(got), err)
+	}
+}
+
+func TestAuditSnapshotSurvivesAppendRotationAndPruning(t *testing.T) {
+	for _, maxBytes := range []int64{1, 4096} {
+		t.Run(time.Duration(maxBytes).String(), func(t *testing.T) {
+			log, err := openAuditLog(filepath.Join(t.TempDir(), "audit.jsonl"), maxBytes, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer log.Close()
+			if err := log.Append(AuditEvent{Action: "before"}); err != nil {
+				t.Fatal(err)
+			}
+			files, err := log.snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeAuditFiles(files)
+			// 查询不持有追加锁；轮转时原文件还可能被淘汰。
+			for i := 0; i < 3; i++ {
+				if err := log.Append(AuditEvent{Action: "after"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := readAuditFiles(files, AuditQuery{})
+			if err != nil || strings.Join(actionsOf(got), ",") != "before" {
+				t.Fatalf("snapshot changed: %v, err=%v", actionsOf(got), err)
+			}
+		})
+	}
+}
+
+func TestAuditRecoversRotationBeforeActiveFileCreation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	log, err := OpenAuditLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Append(AuditEvent{Action: "before"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, path+".00000000000000000001"); err != nil {
+		t.Fatal(err)
+	}
+	log, err = OpenAuditLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	if err := log.Append(AuditEvent{Action: "after"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := log.Query(AuditQuery{})
+	if err != nil || strings.Join(actionsOf(got), ",") != "before,after" {
+		t.Fatalf("rotation recovery=%v, err=%v", actionsOf(got), err)
+	}
+}
+
+func TestAuditRejectsUnreadableOversizedRecord(t *testing.T) {
+	log, err := OpenAuditLog(filepath.Join(t.TempDir(), "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	if err := log.Append(AuditEvent{Detail: strings.Repeat("x", maxAuditRecordBytes)}); err == nil {
+		t.Fatal("oversized record accepted")
+	}
+	if err := log.Append(AuditEvent{Action: "small"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := log.Query(AuditQuery{})
+	if err != nil || len(got) != 1 || got[0].Action != "small" {
+		t.Fatalf("oversized record damaged history: %v, %v", got, err)
+	}
+}
+
+func TestAuditConcurrentQueriesAndRotation(t *testing.T) {
+	log, err := openAuditLog(filepath.Join(t.TempDir(), "audit.jsonl"), 512, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Go(func() {
+			for j := 0; j < 30; j++ {
+				if err := log.Append(AuditEvent{Action: "append"}); err != nil {
+					t.Errorf("append: %v", err)
+					return
+				}
+			}
+		})
+		wg.Go(func() {
+			for j := 0; j < 30; j++ {
+				if _, err := log.Query(AuditQuery{}); err != nil {
+					t.Errorf("query: %v", err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if err := log.Append(AuditEvent{Action: "last"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := log.Query(AuditQuery{})
+	if err != nil || len(got) == 0 || got[len(got)-1].Action != "last" {
+		t.Fatalf("last committed event missing: %v, %v", got, err)
 	}
 }

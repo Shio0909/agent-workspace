@@ -229,3 +229,24 @@ func TestEventWorkerRequeuesFailures(t *testing.T) {
 		t.Fatal("StartEvents did not stop after cancellation")
 	}
 }
+
+func TestEventQueueRetryDoesNotDelayNewEvent(t *testing.T) {
+	q := newEventQueue()
+	defer q.Shutdown()
+	q.Add("demo")
+	if id, ok := q.Get(); !ok || id != "demo" {
+		t.Fatalf("Get()=%q,%v", id, ok)
+	}
+	// Reconcile 正在处理时又收到事件，随后本次处理失败。
+	q.Add("demo")
+	q.mu.Lock()
+	ready := q.pending["demo"]
+	q.mu.Unlock()
+	q.AddRateLimited("demo")
+	q.mu.Lock()
+	retry := q.pending["demo"]
+	q.mu.Unlock()
+	if retry.After(ready) {
+		t.Fatalf("retry delayed a new event: %s -> %s", ready, retry)
+	}
+}

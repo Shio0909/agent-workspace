@@ -16,6 +16,7 @@ This project decides when a workspace runs, sleeps, and is reclaimed, forwards t
 - Three-stage reclamation: idle stop, suspension, and hard delete after a grace period.
 - Idempotent lifecycle operations using caller-provided business IDs.
 - Durable intent and reconciliation across controller restarts.
+- Offline backup and restore of the control-plane state (verified archive, atomic publish, safe unpack); see [docs/backup-restore.md](docs/backup-restore.md).
 - Event-driven reconciliation with a rate-limited retry queue.
 - Kubernetes informer cache for managed workloads, with direct API fallback.
 - Bounded reconciliation concurrency and per-workspace serialization.

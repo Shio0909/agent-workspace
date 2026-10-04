@@ -140,9 +140,11 @@ type Profile struct {
 	// workspace that is not running is not touched: it starts with the new key.
 	RestartOnCredentialChange bool `json:"restart_on_credential_change,omitempty"`
 	// AllowedImages lists the images a workspace of this profile may be
-	// upgraded to: exact references, or a prefix ending in "*". Empty disables
-	// upgrades, because an API that accepts any image is an API that runs any
-	// code in the cluster.
+	// upgraded to: exact references, or a prefix ending in "*".
+	// Prefer "registry/team/*" or "repo:*" to delimit the intended scope;
+	// "repo*" also allows names such as "repo-evil" by design.
+	// Empty disables upgrades: accepting any image would allow arbitrary
+	// code to run in the cluster.
 	AllowedImages []string `json:"allowed_images,omitempty"`
 	// HeartbeatPath, when set, is polled on a running workspace. The workload
 	// reports whether it is busy, which counts as activity, and a workload that

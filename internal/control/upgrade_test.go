@@ -391,3 +391,23 @@ func TestProfileValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestImageAllowlistUsesExplicitPrefixSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		pattern string
+		image   string
+		want    bool
+	}{
+		{"registry/team/*", "registry/team/agent:v1", true},
+		{"registry/team/*", "registry/team-evil/agent:v1", false},
+		{"registry/agent:*", "registry/agent:v2", true},
+		{"registry/agent:*", "registry/agent-evil:v2", false},
+		{"registry/agent*", "registry/agent-evil:v2", true},
+		{"registry/agent@sha256:abc", "registry/agent@sha256:abc", true},
+		{"registry/agent@sha256:abc", "registry/agent@sha256:def", false},
+	} {
+		if got := imageAllowed(Profile{AllowedImages: []string{tc.pattern}}, tc.image); got != tc.want {
+			t.Errorf("pattern=%q, image=%q: got %v, want %v", tc.pattern, tc.image, got, tc.want)
+		}
+	}
+}

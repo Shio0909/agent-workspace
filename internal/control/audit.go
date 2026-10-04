@@ -5,7 +5,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,30 +39,120 @@ type AuditQuery struct {
 	Action    string
 	Since     time.Time
 	Until     time.Time
-	// Limit 按时间正序取前 N 条；0 表示不限。想要最近 N 条请显式给 Since，
+	// Limit 按追加顺序取前 N 条；0 表示不限。想要最近 N 条请显式给 Since，
 	// 因为只追加的文件不会倒着读。
 	Limit int
 }
 
-// AuditLog 是 append-only 的 JSONL 文件。选 JSONL 而不是结构化存储，是为了
-// 让审计在控制器之外也能被读取：一次 grep 就能查，不需要本项目的代码。
+// AuditLog 保留当前 JSONL 文件和有限归档。查询先打开文件快照，再解锁扫描；
+// 即使扫描期间轮转、删除旧归档，打开的文件仍可读取。
+const (
+	defaultAuditMaxBytes = 8 << 20
+	defaultAuditArchives = 4
+	maxAuditRecordBytes  = 1 << 20
+)
+
 type AuditLog struct {
-	mu   sync.Mutex
-	path string
-	file *os.File
+	mu         sync.Mutex
+	path       string
+	file       *os.File
+	size       int64
+	sequence   uint64
+	maxBytes   int64
+	archives   int
+	closed     bool
+	needsPrune bool
 }
 
 func OpenAuditLog(path string) (*AuditLog, error) {
-	// O_RDWR 而不是只写：打开时要读最后一个字节，判断上次是否留下了半行。
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	return openAuditLog(path, defaultAuditMaxBytes, defaultAuditArchives)
+}
+
+func openAuditLog(path string, maxBytes int64, archives int) (*AuditLog, error) {
+	path = filepath.Clean(path)
+	l := &AuditLog{path: path, maxBytes: maxBytes, archives: archives}
+	files, err := l.archivePaths()
 	if err != nil {
 		return nil, err
 	}
-	if err := repairTornTail(f); err != nil {
-		f.Close()
+	l.needsPrune = len(files) > archives
+	if len(files) > 0 {
+		l.sequence, _ = strconv.ParseUint(strings.TrimPrefix(files[len(files)-1], path+"."), 10, 64)
+	}
+	if err := l.openActive(); err != nil {
 		return nil, err
 	}
-	return &AuditLog{path: path, file: f}, nil
+	return l, nil
+}
+
+// openActive 也恢复“旧文件已归档、新文件还没创建”时中断的轮转。
+func (l *AuditLog) openActive() error {
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	if err != nil {
+		return err
+	}
+	if err := repairTornTail(f); err != nil {
+		f.Close()
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	l.file, l.size = f, info.Size()
+	return nil
+}
+
+// 只识别本日志的固定宽度序号，忽略同目录的其他文件。
+func (l *AuditLog) archivePaths() ([]string, error) {
+	entries, err := os.ReadDir(filepath.Dir(l.path))
+	if err != nil {
+		return nil, err
+	}
+	prefix := filepath.Base(l.path) + "."
+	var paths []string
+	for _, entry := range entries {
+		suffix, ok := strings.CutPrefix(entry.Name(), prefix)
+		if entry.IsDir() || !ok || len(suffix) != 20 || strings.Trim(suffix, "0123456789") != "" {
+			continue
+		}
+		if _, err := strconv.ParseUint(suffix, 10, 64); err != nil {
+			continue
+		}
+		paths = append(paths, filepath.Join(filepath.Dir(l.path), entry.Name()))
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+// rotate 不搬动既有归档，避免中断一串重命名导致历史被覆盖。
+func (l *AuditLog) rotate() error {
+	archive := fmt.Sprintf("%s.%020d", l.path, l.sequence+1)
+	if err := os.Rename(l.path, archive); err != nil {
+		return err
+	}
+	l.sequence++
+	l.needsPrune = true
+	err := l.file.Close()
+	l.file = nil
+	if err != nil {
+		return err
+	}
+	return l.openActive()
+}
+
+func (l *AuditLog) prune() error {
+	paths, err := l.archivePaths()
+	if err != nil {
+		return err
+	}
+	for _, path := range paths[:max(0, len(paths)-l.archives)] {
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // repairTornTail 在文件末尾补一个换行。崩溃可能把一条记录只写了一半，如果不
@@ -83,61 +179,131 @@ func (l *AuditLog) Path() string { return l.path }
 func (l *AuditLog) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.closed = true
+	if l.file == nil {
+		return nil
+	}
 	return l.file.Close()
 }
 
-// Append 写入一行并 fsync。审计是同步写：调用方宁可多等一次磁盘，也不希望
-// 崩溃后查不到刚刚发生的状态变更。
+// Append 仍同步 fsync；单条记录不拆分，过大的记录拒绝，避免无法查询。
 func (l *AuditLog) Append(e AuditEvent) error {
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
+	if len(b) > maxAuditRecordBytes {
+		return fmt.Errorf("audit record exceeds %d bytes", maxAuditRecordBytes)
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if _, err := l.file.Write(b); err != nil {
+	if l.closed {
+		return os.ErrClosed
+	}
+	if l.file == nil {
+		if err := l.openActive(); err != nil {
+			return err
+		}
+	}
+	if l.size > 0 && l.size+int64(len(b)) > l.maxBytes {
+		if err := l.rotate(); err != nil {
+			return err
+		}
+	}
+	n, err := l.file.Write(b)
+	l.size += int64(n)
+	if err != nil {
 		return err
 	}
-	return l.file.Sync()
+	if err := l.file.Sync(); err != nil {
+		return err
+	}
+	// 新记录落盘后才淘汰历史。失败由既有 AuditFailures 机制暴露。
+	if l.needsPrune {
+		if err := l.prune(); err != nil {
+			return err
+		}
+		l.needsPrune = false
+	}
+	return nil
 }
 
-// Query 每次都重新读文件。审计日志是进程重启后唯一的事实来源，所以这里不
-// 缓存、也不维护内存副本，代价是查询比状态快照慢，这是有意的取舍。
-func (l *AuditLog) Query(q AuditQuery) ([]AuditEvent, error) {
+type auditFile struct {
+	file *os.File
+	size int64
+}
+
+func closeAuditFiles(files []auditFile) {
+	for _, f := range files {
+		f.file.Close()
+	}
+}
+
+func (l *AuditLog) snapshot() ([]auditFile, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	f, err := os.Open(l.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	paths, err := l.archivePaths()
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	// 单条事件可能带着较长的错误详情，默认 64KiB 的行上限太小。
-	scanner.Buffer(make([]byte, 0, 16*1024), 1<<20)
+	paths = append(paths, l.path)
+	var files []auditFile
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if errors.Is(err, os.ErrNotExist) && path == l.path {
+			continue
+		}
+		if err != nil {
+			closeAuditFiles(files)
+			return nil, err
+		}
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			closeAuditFiles(files)
+			return nil, err
+		}
+		files = append(files, auditFile{f, info.Size()})
+	}
+	return files, nil
+}
+
+// Query 按追加顺序扫描保留的历史；快照后的追加不会改变本次查询。
+func (l *AuditLog) Query(q AuditQuery) ([]AuditEvent, error) {
+	files, err := l.snapshot()
+	if err != nil {
+		return nil, err
+	}
+	defer closeAuditFiles(files)
+	return readAuditFiles(files, q)
+}
+
+func readAuditFiles(files []auditFile, q AuditQuery) ([]AuditEvent, error) {
 	var out []AuditEvent
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
+	for _, f := range files {
+		scanner := bufio.NewScanner(io.NewSectionReader(f.file, 0, f.size))
+		scanner.Buffer(make([]byte, 0, 16*1024), maxAuditRecordBytes+1)
+		for scanner.Scan() {
+			line := bytes.TrimSpace(scanner.Bytes())
+			if len(line) == 0 {
+				continue
+			}
+			var e AuditEvent
+			// 崩溃留下的半行不影响后续完整记录。
+			if err := json.Unmarshal(line, &e); err != nil || !q.match(e) {
+				continue
+			}
+			out = append(out, e)
+			if q.Limit > 0 && len(out) >= q.Limit {
+				return out, nil
+			}
 		}
-		var e AuditEvent
-		// 崩溃可能留下写了一半的行；跳过它，而不是让整个查询失败。
-		if err := json.Unmarshal(line, &e); err != nil {
-			continue
-		}
-		if !q.match(e) {
-			continue
-		}
-		out = append(out, e)
-		if q.Limit > 0 && len(out) >= q.Limit {
-			break
+		if err := scanner.Err(); err != nil {
+			return out, err
 		}
 	}
-	return out, scanner.Err()
+	return out, nil
 }
 
 func (q AuditQuery) match(e AuditEvent) bool {

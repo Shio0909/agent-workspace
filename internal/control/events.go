@@ -119,7 +119,11 @@ func (q *eventQueue) AddRateLimited(id string) {
 	}
 	q.failures[id]++
 	delay := eventRetryBase << min(q.failures[id]-1, 20)
-	q.pending[id] = time.Now().Add(min(delay, eventRetryMax))
+	retry := time.Now().Add(min(delay, eventRetryMax))
+	// 处理中到达的新事件不能被失败收尾重新推迟。
+	if ready, exists := q.pending[id]; !exists || retry.Before(ready) {
+		q.pending[id] = retry
+	}
 	q.notify()
 }
 

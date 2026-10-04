@@ -49,3 +49,21 @@ hardened for multi-tenant or untrusted-code workloads.
 
 Please report vulnerabilities privately through GitHub Security Advisories
 instead of a public issue. Include reproduction steps and the affected commit.
+
+## Image allowlist patterns
+
+`allowed_images` accepts exact image references or a literal prefix followed by
+a trailing `*`. Use `registry/team/*` for a repository namespace, `repo:*` for
+tags of one repository, or an exact digest reference to pin content. A broad
+pattern such as `repo*` intentionally also matches `repo-evil`; it is not a
+repository-boundary pattern. Allowlist authors must choose the boundary
+explicitly. A mutable tag is not a guarantee of immutable image content.
+
+## Audit retention
+
+The local audit log rotates at 8 MiB and keeps four archives plus the current
+file. Older retained records are removed on subsequent writes. Export records
+to a separate audit system if longer retention is required. Queries use a file
+snapshot and do not hold the append lock while scanning. These changes bound
+normal local retention; they do not make the caller-supplied Actor a verified
+identity or provide tamper-proof auditing.

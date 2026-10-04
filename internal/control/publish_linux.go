@@ -1,0 +1,9 @@
+//go:build linux
+
+package control
+
+import "golang.org/x/sys/unix"
+
+func publishNoReplace(from, to string) error {
+	return unix.Renameat2(unix.AT_FDCWD, from, unix.AT_FDCWD, to, unix.RENAME_NOREPLACE)
+}
